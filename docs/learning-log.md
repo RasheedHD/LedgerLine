@@ -36,3 +36,23 @@ the backstop under it.
 A default looks like a safety net but would mask the bug where the app forgot
 to set it — the insert succeeds with a plausible timestamp and every lateness
 calculation downstream is silently wrong.
+
+## 2026-07-29 — POST /events, first Go code
+
+**What we built:** `cmd/ingest/main.go` and `billing/ingest/handler.go`. Plain
+`net/http`, no framework. Decode JSON, insert one row, return 202. No dedup,
+no validation. First dependency: `jackc/pgx/v5`, used only through
+`database/sql`.
+
+**Key decision:** Handler does a bare INSERT and does not inspect the error, so
+a repeated idempotency key comes back as a 500. Rejected the alternative
+(`ON CONFLICT DO NOTHING`, return 202 twice) because that is already the fix,
+and I wanted to see the failure first. My plan predicted two duplicate rows;
+what actually happens is one row and a rejected insert — the unique constraint
+from migration 000001 catches it. The real bug is not "duplicate row", it is
+"a correct client retried and got a 500".
+
+**Couldn't have written myself yet:** That `sql.Open` doesn't connect. It only
+validates the DSN and builds a lazy pool, so without an explicit `Ping` at
+startup a dead database first shows up as a failing request and reads like a
+handler bug.
