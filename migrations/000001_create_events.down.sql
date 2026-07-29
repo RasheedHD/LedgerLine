@@ -1,0 +1,12 @@
+-- Reverses 000001_create_events.up.sql.
+--
+-- The index and the unique constraint are both owned by the table, so
+-- dropping the table takes them with it. No need to drop them separately.
+--
+-- IF EXISTS so that a down migration run against a partially-applied state
+-- does not itself fail and leave the schema_migrations table dirty.
+--
+-- Worth being clear-eyed about what this does: in development it resets the
+-- schema, but run against anything holding real usage it destroys billing
+-- records with no way to reconstruct them from Postgres alone.
+DROP TABLE IF EXISTS events;
