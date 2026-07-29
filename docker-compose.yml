@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ledgerline-postgres
+    environment:
+      POSTGRES_USER: ledgerline
+      POSTGRES_PASSWORD: ledgerline
+      POSTGRES_DB: ledgerline
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume, not a bind mount. The database files live inside Docker
+      # rather than in the repo, so `git status` stays clean and the data
+      # survives `docker compose down` (only `down -v` destroys it).
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Without this, `up -d` returns as soon as the container starts, but
+      # Postgres is still running first-boot initdb and refuses connections
+      # for a second or two. The healthcheck gives us something to wait on.
+      test: ["CMD-SHELL", "pg_isready -U ledgerline -d ledgerline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
