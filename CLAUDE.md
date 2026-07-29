@@ -20,7 +20,7 @@ Follow these four steps in order. Do not skip to step 3.
    was made, not just what the code does.
 4. **Quiz me.** Ask me 3 questions about what you just wrote. At least one
    must be a "what breaks if..." question. If I get one wrong, re-explain
-   that part differently - don't just give me the answer.
+   that part differently - don't just give me the answer. (They are optional; I don't have to answer)
 
 ## How to write code for me
 
