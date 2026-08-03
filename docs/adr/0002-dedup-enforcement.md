@@ -1,9 +1,14 @@
 # ADR-0002: Deduplication is enforced by a database constraint
 
-- **Status:** Accepted
+- **Status:** Accepted, superseded in part by [ADR-0004](0004-ingest-api-contract.md)
 - **Date:** 2026-07-29
 - **Deciders:** Rasheed
 - **Related:** [ADR-0001](0001-event-schema.md)
+
+> **Amendment (2026-08-03):** the Consequences bullet below claiming that
+> callers cannot distinguish "stored" from "already had it" contradicted
+> ADR-0001 and is superseded by ADR-0004. Duplicates return `202` as this ADR
+> says, but the body carries a `duplicate` flag. The rest stands.
 
 ## Context
 

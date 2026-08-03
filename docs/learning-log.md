@@ -56,3 +56,23 @@ from migration 000001 catches it. The real bug is not "duplicate row", it is
 validates the DSN and builds a lazy pool, so without an explicit `Ping` at
 startup a dead database first shows up as a failing request and reads like a
 handler bug.
+
+## 2026-08-03 — PLAN.md, then Phase 1 ingest correctness
+
+**What we built:** PLAN.md as the project anchor — invariants I1–I6, eight
+phases, debt register. Then the first tests in the repo (31, against a real
+Postgres via `internal/testdb`), full request validation, and the duplicate fix:
+`202` with `{"duplicate":true}` and the original id instead of a `500`.
+
+**Key decision:** ADR-0001 and ADR-0002 contradicted each other on whether a
+duplicate is distinguishable from a fresh accept. Resolved in ADR-0004 by
+noticing they were arguing about different layers — status code carries the
+outcome class (`202`, stop retrying), body carries the detail (`duplicate`).
+Rejected `409`, which tells a correct client its request was invalid.
+
+**Couldn't have written myself yet:** Why `ON CONFLICT DO UPDATE` beats
+`DO NOTHING` plus a follow-up `SELECT`. Not just that `DO NOTHING ... RETURNING`
+yields no rows — the `SELECT` also *races*: under READ COMMITTED the conflicting
+row may belong to an uncommitted transaction, so it finds nothing. `DO UPDATE`
+blocks until that transaction resolves. Also learned `(xmax = 0)` as the way to
+tell an insert from a conflict in one round trip.

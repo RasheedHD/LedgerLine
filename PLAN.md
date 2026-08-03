@@ -190,22 +190,32 @@ Docker Desktop is stopped and nothing is listening on `:8080`. Neither is a
 problem — both are started on demand — but it means the database contents are
 unverified as of today.
 
-### Known-broken on purpose
+### Ingest is now correct and tested (2026-08-03)
 
-- A duplicate key returns **`500`**. This was a deliberate choice to make the
-  bug visible before fixing it. It is Phase 1's first job.
-- There is **no validation**. An empty JSON body reaches Postgres and fails as
-  `invalid input syntax for type numeric: ""`. The database is currently the
-  only validator.
+- **A duplicate returns `202` with `{"id":N,"duplicate":true}`** — same id, one
+  row. `ON CONFLICT DO UPDATE` with `(xmax = 0)` to tell insert from conflict.
+  See [ADR-0004](docs/adr/0004-ingest-api-contract.md).
+- **Full validation** ahead of any database work: required fields, decimal
+  quantity within `NUMERIC(38,9)`, no negatives, no scientific notation,
+  5-minute clock-skew tolerance, 35-day backfill bound, unknown fields
+  rejected.
+- **31 tests, all passing**, against a real Postgres. Confirmed genuinely
+  running rather than skipped. The suite was mutation-checked: breaking
+  duplicate detection makes `TestRetryIsIdempotent` fail with the intended
+  message, so the assertions have teeth.
+- `TestConcurrentRetriesProduceOneRow` — 50 concurrent goroutines with the same
+  key produce exactly one row. This is the test that earns ADR-0002's rejection
+  of check-then-insert: a `SELECT`-then-`INSERT` implementation passes the
+  simple retry test and fails this one.
 
-### The uncomfortable gap
+### Test harness
 
-**There are zero tests in this repository.** CLAUDE.md lists "table-driven
-tests, and explain what each case is proving" under *Always*. Three sessions
-in, that rule has not been honoured once. Every verification so far has been
-manual `curl` and `psql`. This is debt item **D1** and it is the single
-biggest risk to the project, because every invariant in section 2 is a claim
-that can only be defended by a test.
+`internal/testdb` gives each test a real Postgres, against a **separate
+`ledgerline_test` database** so the dev database is never touched. Schema is
+dropped and replayed from `migrations/` once per binary; tables are truncated
+between tests. Tests **skip** rather than fail when no database is reachable,
+which keeps `go test ./...` usable without Docker — at the cost that a green
+run proves nothing unless the tests actually ran. CI must assert that.
 
 ---
 
@@ -259,15 +269,16 @@ fingerprinting; test strategy (real DB vs. mocks).
 
 **Exit criteria:**
 
-- [ ] Two identical POSTs → two `202`s, one row, and the response distinguishes
+- [x] Two identical POSTs → two `202`s, one row, and the response distinguishes
       the second as a duplicate
 - [ ] Same key + different payload → explicit error, never a silent discard
-- [ ] N concurrent goroutines POSTing the same key → exactly one row (this is
+      *(D6, needs the payload fingerprint)*
+- [x] N concurrent goroutines POSTing the same key → exactly one row (this is
       the test that proves check-then-insert was correctly rejected)
-- [ ] Empty body, missing field, negative quantity, malformed timestamp,
+- [x] Empty body, missing field, negative quantity, malformed timestamp,
       future timestamp, 40-day-old timestamp → each a distinct 4xx, none
       reaching Postgres
-- [ ] `go test ./...` passes and covers all of the above
+- [x] `go test ./...` passes and covers all of the above
 
 **Prepares you to answer:** *How do you make an HTTP endpoint idempotent?
 What's actually wrong with SELECT-then-INSERT? Why is a unique constraint
@@ -547,22 +558,25 @@ Append-only. Close items by marking them, not deleting them.
 
 | ID | Item | Source | Phase |
 |---|---|---|---|
-| **D1** | **Zero tests in the repo**, despite CLAUDE.md requiring them always | — | 1 |
-| **D2** | ADR-0001 says accepted/duplicate/too-old must be distinguishable; ADR-0002 says duplicates are indistinguishable `202`s. **Direct contradiction** | ADR-0001, ADR-0002 | 1 |
+| ~~D1~~ | ~~Zero tests in the repo~~ — **closed 2026-08-03.** 31 tests against real Postgres; harness in `internal/testdb` | — | 1 |
+| ~~D2~~ | ~~ADR contradiction on duplicate distinguishability~~ — **closed 2026-08-03** by ADR-0004: status carries outcome class, body carries detail | ADR-0004 | 1 |
 | **D3** | ADR-0001 §5 says late events are "flagged"; §1's struct has no such field and the migration derives it | ADR-0001 | 6 |
-| **D4** | Duplicate key returns `500` — a correct client retrying is told the server broke | ADR-0002 | 1 |
-| **D5** | No validation at all; empty body fails inside Postgres as `22P02` | code | 1 |
+| ~~D4~~ | ~~Duplicate key returns `500`~~ — **closed 2026-08-03.** Returns `202` with `duplicate: true` and the original id | ADR-0004 | 1 |
+| ~~D5~~ | ~~No validation at all~~ — **closed 2026-08-03.** Full validation before any database work | ADR-0004 | 1 |
 | **D6** | **Same key + different payload is silently discarded and reported as success** — likely the worst correctness hole currently in the design | ADR-0002 | 1 |
 | **D7** | Bounded, day-partitioned dedup table not built; the unbounded constraint is doing all the work | ADR-0001 §4 | 1 |
 | **D8** | Connection pool entirely at defaults — unbounded connections | ADR-0003 | 1 |
 | **D9** | No graceful shutdown; in-flight requests die on exit | code | 8 |
 | **D10** | Dev credentials hardcoded as a fallback DSN in `main.go` | code | 8 |
-| **D11** | No clock-skew clamp on client-supplied `occurred_at` | ADR-0001 | 1 |
+| ~~D11~~ | ~~No clock-skew clamp on `occurred_at`~~ — **closed 2026-08-03.** 5-minute forward tolerance | ADR-0004 | 1 |
 | **D12** | No meter registry — a typo'd meter name is a silent no-op | ADR-0001 | 4 |
-| **D13** | 35-day backfill bound specified but enforced nowhere | ADR-0001 §5 | 1 |
+| ~~D13~~ | ~~35-day backfill bound enforced nowhere~~ — **closed 2026-08-03.** Enforced, with its own `422 event_too_old` | ADR-0004 | 1 |
 | **D14** | Whether to store the original response body for Stripe-style replay, or only the id | ADR-0002 | 1 |
 | **D15** | Whether dedup belongs before or after the log write — broker's job or billing's | ADR-0002 | 3 |
 | **D16** | No CI, no task runner | — | 8 |
+| **D18** | Every duplicate writes a dead tuple via the no-op `DO UPDATE`; autovacuum work scales with duplicate volume | ADR-0004 | 1 |
+| **D19** | Integration tests skip silently without a database, so a green `go test ./...` can prove nothing. CI must assert they ran | code | 8 |
+| **D20** | Docker Desktop leaves undeletable stale socket reparse points on unclean exit, blocking every subsequent start. Cleared by renaming `%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine` | env | — |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
 
 ---
@@ -574,6 +588,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0001](docs/adr/0001-event-schema.md) | The UsageEvent schema | Accepted |
 | [0002](docs/adr/0002-dedup-enforcement.md) | Deduplication is enforced by a database constraint | Accepted |
 | [0003](docs/adr/0003-postgres-driver.md) | pgx as the Postgres driver, used through database/sql | Accepted |
+| [0004](docs/adr/0004-ingest-api-contract.md) | The POST /events contract | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -622,17 +637,17 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phase 1, in this order:**
+**Finish Phase 1: `billing/dedup/`.**
 
-1. **D1 — stand up the test harness.** Every Phase 1 exit criterion is a test
-   and there is nowhere to put them. Nothing else can be verified until this
-   exists, so it goes first.
-2. **D2 — resolve the ADR contradiction.** ADR-0001 says accepted / duplicate /
-   too-old must be distinguishable; ADR-0002 says duplicates are
-   indistinguishable `202`s. Writing the duplicate-handling code before settling
-   this means implementing one of two incompatible specs at random. Resolved by
-   a new ADR that supersedes whichever loses.
-3. **D4, D5, D11, D13 — the handler.** Validation, error taxonomy, and the
-   `202`-on-duplicate fix, together with their tests.
-4. **D6, D7 — the dedup package.** Payload fingerprinting and the bounded,
-   day-partitioned table.
+1. **D6 — payload fingerprinting.** The last correctness hole in ingest. A
+   client reusing a key for genuinely different usage currently gets a `202`
+   and has its event silently discarded — we lose billable usage *and* report
+   success. Needs migration 000002 adding a fingerprint column, a hash over the
+   billable fields, and a new rejection when a key returns with a different
+   payload. This is also the last unticked Phase 1 exit criterion.
+2. **D7 — the bounded dedup table.** Day-partitioned, 7-day retention,
+   `DROP PARTITION` expiry, sitting in front of the constraint as a fast path
+   and never as the source of truth. Also relieves D18, since most duplicates
+   would stop before reaching the `DO UPDATE`.
+
+Then Phase 2, the broker log — the biggest single piece in the project.
