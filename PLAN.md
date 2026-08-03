@@ -7,7 +7,8 @@
 
 - **Last updated:** 2026-08-03
 - **Repo:** `github.com/RasheedHD/LedgerLine`
-- **Working agreement:** [CLAUDE.md](CLAUDE.md) — the teach → plan → write → quiz loop
+- **Working agreement:** [CLAUDE.md](CLAUDE.md) — build first, walk through
+  after. The tutoring loop is paused; priority is a portfolio-grade result.
 - **Decision record:** [docs/adr/](docs/adr/)
 - **Session notes:** [docs/learning-log.md](docs/learning-log.md)
 
@@ -154,11 +155,10 @@ Target shape at project completion:
 | `migrations/` | golang-migrate SQL | 1 migration |
 | `docs/adr/` | Design decisions | 3 ADRs |
 
-**Note:** `billing/dedup/`, `billing/ledger/`, and `broker/log/` are singled
-out in CLAUDE.md. The heading that explained why was removed in the current
-uncommitted edit, leaving the three bullets orphaned. Historically they were
-"the files I write myself, with you in tutor mode." **Confirm whether that
-still holds** — it changes how Phases 1, 2, and 5 get executed.
+**Note:** `billing/dedup/`, `billing/ledger/`, and `broker/log/` are singled out
+in CLAUDE.md as the three components that matter most — the interview
+conversation, with everything else supporting them. They get the most care, the
+best tests, and the clearest comments. They are Phases 1, 5, and 2.
 
 ---
 
@@ -563,7 +563,7 @@ Append-only. Close items by marking them, not deleting them.
 | **D14** | Whether to store the original response body for Stripe-style replay, or only the id | ADR-0002 | 1 |
 | **D15** | Whether dedup belongs before or after the log write — broker's job or billing's | ADR-0002 | 3 |
 | **D16** | No CI, no task runner | — | 8 |
-| **D17** | CLAUDE.md's orphaned three-directory list — confirm whether "files I write myself" still applies | CLAUDE.md | next session |
+| ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
 
 ---
 
@@ -622,13 +622,17 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phase 1, item 1: make the duplicate return `202` instead of `500`.**
+**Phase 1, in this order:**
 
-But per the working agreement, that starts with the teach step — and the first
-thing to settle is **D2**, because ADR-0001 and ADR-0002 currently contradict
-each other about what a duplicate response should even look like. Writing code
-before resolving that means implementing one of two incompatible specs at
-random.
-
-Second, and arguably before any of it: **D1**. Phase 1's exit criteria are all
-tests. There is no test harness to put them in.
+1. **D1 — stand up the test harness.** Every Phase 1 exit criterion is a test
+   and there is nowhere to put them. Nothing else can be verified until this
+   exists, so it goes first.
+2. **D2 — resolve the ADR contradiction.** ADR-0001 says accepted / duplicate /
+   too-old must be distinguishable; ADR-0002 says duplicates are
+   indistinguishable `202`s. Writing the duplicate-handling code before settling
+   this means implementing one of two incompatible specs at random. Resolved by
+   a new ADR that supersedes whichever loses.
+3. **D4, D5, D11, D13 — the handler.** Validation, error taxonomy, and the
+   `202`-on-duplicate fix, together with their tests.
+4. **D6, D7 — the dedup package.** Payload fingerprinting and the bounded,
+   day-partitioned table.
