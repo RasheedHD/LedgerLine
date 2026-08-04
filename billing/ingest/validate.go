@@ -37,6 +37,11 @@ const (
 	codeMalformed = "malformed_request"
 	codeInvalid   = "invalid_field"
 	codeTooOld    = "event_too_old"
+
+	// Unlike a plain duplicate -- which is a client doing exactly the right
+	// thing after a dropped connection -- reusing a key for different usage is
+	// a genuine client bug, and gets a genuine client error. ADR-0005.
+	codeKeyReuse = "idempotency_key_reuse"
 )
 
 // rejection is a refusal to accept an event, carrying everything needed to

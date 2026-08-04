@@ -199,10 +199,17 @@ unverified as of today.
   quantity within `NUMERIC(38,9)`, no negatives, no scientific notation,
   5-minute clock-skew tolerance, 35-day backfill bound, unknown fields
   rejected.
-- **31 tests, all passing**, against a real Postgres. Confirmed genuinely
-  running rather than skipped. The suite was mutation-checked: breaking
-  duplicate detection makes `TestRetryIsIdempotent` fail with the intended
-  message, so the assertions have teeth.
+- **Reuse detection.** Every event stores a SHA-256 fingerprint over its
+  billable fields. A key returning with different content gets
+  `409 idempotency_key_reuse` instead of being silently discarded with a `202`.
+  Formatting differences (`"1"` vs `"1.0"`) canonicalise to the same
+  fingerprint, so a reformatted retry is still a retry. See
+  [ADR-0005](docs/adr/0005-payload-fingerprint.md).
+- **64 assertions, all passing**, against a real Postgres. Confirmed genuinely
+  running rather than skipped. Mutation-checked twice: breaking duplicate
+  detection fails `TestRetryIsIdempotent`, and removing the fingerprint's
+  length prefix fails `TestFingerprintIsUnambiguousAcrossFieldBoundaries`. The
+  assertions have teeth.
 - `TestConcurrentRetriesProduceOneRow` — 50 concurrent goroutines with the same
   key produce exactly one row. This is the test that earns ADR-0002's rejection
   of check-then-insert: a `SELECT`-then-`INSERT` implementation passes the
@@ -271,8 +278,7 @@ fingerprinting; test strategy (real DB vs. mocks).
 
 - [x] Two identical POSTs → two `202`s, one row, and the response distinguishes
       the second as a duplicate
-- [ ] Same key + different payload → explicit error, never a silent discard
-      *(D6, needs the payload fingerprint)*
+- [x] Same key + different payload → explicit error, never a silent discard
 - [x] N concurrent goroutines POSTing the same key → exactly one row (this is
       the test that proves check-then-insert was correctly rejected)
 - [x] Empty body, missing field, negative quantity, malformed timestamp,
@@ -563,8 +569,8 @@ Append-only. Close items by marking them, not deleting them.
 | **D3** | ADR-0001 §5 says late events are "flagged"; §1's struct has no such field and the migration derives it | ADR-0001 | 6 |
 | ~~D4~~ | ~~Duplicate key returns `500`~~ — **closed 2026-08-03.** Returns `202` with `duplicate: true` and the original id | ADR-0004 | 1 |
 | ~~D5~~ | ~~No validation at all~~ — **closed 2026-08-03.** Full validation before any database work | ADR-0004 | 1 |
-| **D6** | **Same key + different payload is silently discarded and reported as success** — likely the worst correctness hole currently in the design | ADR-0002 | 1 |
-| **D7** | Bounded, day-partitioned dedup table not built; the unbounded constraint is doing all the work | ADR-0001 §4 | 1 |
+| ~~D6~~ | ~~Same key + different payload silently discarded~~ — **closed 2026-08-03** by ADR-0005: SHA-256 fingerprint, `409 idempotency_key_reuse` on mismatch | ADR-0005 | 1 |
+| **D7** | Bounded, day-partitioned dedup table not built — **deferred to Phase 7, pending benchmark evidence.** As specified it is a cache in front of the constraint, and adding a lookup before the insert makes the *common* path (a new event) two round trips instead of one. It only pays off once the unique index no longer fits in memory, which is unmeasured. ADR-0002's own principle — "the constraint is the invariant, anything in front of it is a cache" — argues against building a cache with no demonstrated need | ADR-0001 §4 | 7 |
 | **D8** | Connection pool entirely at defaults — unbounded connections | ADR-0003 | 1 |
 | **D9** | No graceful shutdown; in-flight requests die on exit | code | 8 |
 | **D10** | Dev credentials hardcoded as a fallback DSN in `main.go` | code | 8 |
@@ -589,6 +595,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0002](docs/adr/0002-dedup-enforcement.md) | Deduplication is enforced by a database constraint | Accepted |
 | [0003](docs/adr/0003-postgres-driver.md) | pgx as the Postgres driver, used through database/sql | Accepted |
 | [0004](docs/adr/0004-ingest-api-contract.md) | The POST /events contract | Accepted |
+| [0005](docs/adr/0005-payload-fingerprint.md) | Detecting a reused idempotency key | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -637,17 +644,23 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Finish Phase 1: `billing/dedup/`.**
+**Phase 1 is complete.** Every exit criterion is ticked and every correctness
+item in ingest is closed. D7 is deferred to Phase 7 with reasoning recorded in
+the debt register — it is an optimisation awaiting evidence, not a missing
+guarantee.
 
-1. **D6 — payload fingerprinting.** The last correctness hole in ingest. A
-   client reusing a key for genuinely different usage currently gets a `202`
-   and has its event silently discarded — we lose billable usage *and* report
-   success. Needs migration 000002 adding a fingerprint column, a hash over the
-   billable fields, and a new rejection when a key returns with a different
-   payload. This is also the last unticked Phase 1 exit criterion.
-2. **D7 — the bounded dedup table.** Day-partitioned, 7-day retention,
-   `DROP PARTITION` expiry, sitting in front of the constraint as a fast path
-   and never as the source of truth. Also relieves D18, since most duplicates
-   would stop before reaching the `DO UPDATE`.
+**Next: Phase 2, `broker/log/`** — the append-only log. The biggest single
+piece in the project and the one the distributed-systems half of the thesis
+rests on. In order:
 
-Then Phase 2, the broker log — the biggest single piece in the project.
+1. **Segment format** — length-prefixed records, CRC32 per record, magic and
+   version in the segment header. Get the framing right before anything is
+   written on top of it.
+2. **Append and read** — the smallest API that works: `Append([]byte) (offset,
+   error)` and `Read(offset)`.
+3. **Recovery on open** — scan the tail, find the last record with a valid CRC,
+   truncate the rest. This is where crash safety actually lives, and it is
+   worth writing the crash test before the recovery code.
+4. **Sparse offset index** — so reads seek near rather than scanning from zero.
+5. **fsync policy** — the durability/throughput dial, and the decision that
+   deserves its own ADR with measured numbers rather than a repeated claim.

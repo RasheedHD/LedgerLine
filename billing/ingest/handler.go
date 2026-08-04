@@ -5,6 +5,7 @@
 package ingest
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -77,12 +78,16 @@ type errorBody struct {
 // tuple returned from the DO UPDATE path was locked and so does not. This is a
 // Postgres implementation detail rather than standard SQL, and it is the price
 // of learning insert-versus-conflict in a single round trip.
+// The returned payload_fingerprint is the STORED one, not the one just
+// offered: the DO UPDATE touches only tenant_id, so every other column in the
+// returned row still holds its original value. That is what makes reuse
+// detectable -- we get back what the key was first used for and can compare.
 const insertEvent = `
-INSERT INTO events (tenant_id, meter, quantity, occurred_at, received_at, idempotency_key)
-VALUES ($1, $2, $3::numeric, $4, $5, $6)
+INSERT INTO events (tenant_id, meter, quantity, occurred_at, received_at, idempotency_key, payload_fingerprint)
+VALUES ($1, $2, $3::numeric, $4, $5, $6, $7)
 ON CONFLICT (tenant_id, idempotency_key)
 DO UPDATE SET tenant_id = events.tenant_id
-RETURNING id, (xmax = 0) AS inserted`
+RETURNING id, (xmax = 0) AS inserted, payload_fingerprint`
 
 // Handler serves POST /events.
 type Handler struct {
@@ -121,8 +126,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// policy is built on sand.
 	receivedAt := h.now().UTC()
 
+	offered := fingerprint(req)
+
 	var id int64
 	var inserted bool
+	var stored []byte
 	err := h.db.QueryRowContext(r.Context(), insertEvent,
 		req.TenantID,
 		req.Meter,
@@ -130,13 +138,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.OccurredAt,
 		receivedAt,
 		req.IdempotencyKey,
-	).Scan(&id, &inserted)
+		offered,
+	).Scan(&id, &inserted, &stored)
 	if err != nil {
 		log.Printf("insert event: %v", err)
 		writeError(w, &rejection{
 			status: http.StatusInternalServerError,
 			code:   "internal_error",
 			detail: "could not store event",
+		})
+		return
+	}
+
+	// CRITICAL: a conflicting key whose stored payload differs is a reused key,
+	// not a retry. Accepting it would discard genuinely different usage while
+	// telling the client it was stored -- undercharging silently, which nobody
+	// ever reports. ADR-0005.
+	//
+	// A NULL stored fingerprint means the row predates migration 000002, so
+	// there is nothing to compare against and we do not pretend otherwise.
+	if !inserted && stored != nil && !bytes.Equal(stored, offered) {
+		writeError(w, &rejection{
+			status: http.StatusConflict,
+			code:   codeKeyReuse,
+			detail: "idempotency_key was already used for an event with different content",
 		})
 		return
 	}

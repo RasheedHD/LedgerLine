@@ -187,6 +187,79 @@ func TestKeysAreScopedPerTenant(t *testing.T) {
 	}
 }
 
+// The hole ADR-0002 identified and ADR-0005 closes. Reusing a key for
+// genuinely different usage must be refused, not waved through -- accepting it
+// discards billable usage while reporting success, which undercharges the
+// customer silently and so is never reported.
+func TestKeyReusedWithDifferentPayloadIsRejected(t *testing.T) {
+	h, db := newTestHandler(t)
+
+	if rec := post(t, h, validBody); rec.Code != http.StatusAccepted {
+		t.Fatalf("first request: status = %d, want 202", rec.Code)
+	}
+
+	// Same key, different quantity.
+	rec := post(t, h, strings.Replace(validBody, `"quantity":"1"`, `"quantity":"999"`, 1))
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 -- divergent usage was accepted as a duplicate (body: %s)",
+			rec.Code, rec.Body)
+	}
+	if got := decodeError(t, rec).Error.Code; got != codeKeyReuse {
+		t.Errorf("code = %q, want %q", got, codeKeyReuse)
+	}
+	if n := countEvents(t, db); n != 1 {
+		t.Errorf("row count = %d, want 1", n)
+	}
+
+	// The stored event must be untouched. A rejected reuse that silently
+	// overwrote the original would be worse than accepting it.
+	var quantity string
+	if err := db.QueryRow("SELECT quantity::text FROM events").Scan(&quantity); err != nil {
+		t.Fatalf("read quantity: %v", err)
+	}
+	if quantity != "1.000000000" {
+		t.Errorf("stored quantity = %q, want the original 1.000000000", quantity)
+	}
+}
+
+// Reuse detection must not fire on formatting. A client sending "1" and then
+// "1.0" on its retry has sent the same event twice, and rejecting that would
+// break the retry path this whole endpoint exists to support.
+func TestRetryWithEquivalentFormattingIsStillADuplicate(t *testing.T) {
+	h, db := newTestHandler(t)
+
+	post(t, h, validBody)
+	rec := post(t, h, strings.Replace(validBody, `"quantity":"1"`, `"quantity":"1.000"`, 1))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 -- a reformatted retry was mistaken for key reuse (body: %s)",
+			rec.Code, rec.Body)
+	}
+	if !decodeAccepted(t, rec).Duplicate {
+		t.Error("duplicate = false, want true")
+	}
+	if n := countEvents(t, db); n != 1 {
+		t.Errorf("row count = %d, want 1", n)
+	}
+}
+
+// Every new row carries a fingerprint; NULL is reserved for rows written
+// before migration 000002.
+func TestFingerprintIsStored(t *testing.T) {
+	h, db := newTestHandler(t)
+
+	post(t, h, validBody)
+
+	var stored []byte
+	if err := db.QueryRow("SELECT payload_fingerprint FROM events").Scan(&stored); err != nil {
+		t.Fatalf("read fingerprint: %v", err)
+	}
+	if len(stored) != 32 {
+		t.Fatalf("fingerprint length = %d, want 32 (SHA-256)", len(stored))
+	}
+}
+
 // Precision survives the whole path: JSON string, Go string, NUMERIC(38,9).
 // Invariant I6 -- if this ever fails, some layer started treating quantity as
 // a number.

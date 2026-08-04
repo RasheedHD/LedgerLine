@@ -76,3 +76,24 @@ yields no rows — the `SELECT` also *races*: under READ COMMITTED the conflicti
 row may belong to an uncommitted transaction, so it finds nothing. `DO UPDATE`
 blocks until that transaction resolves. Also learned `(xmax = 0)` as the way to
 tell an insert from a conflict in one round trip.
+
+## 2026-08-03 (cont.) — payload fingerprinting, Phase 1 done
+
+**What we built:** Migration 000002 and `fingerprint.go`. Every event stores a
+SHA-256 over its billable fields; a key returning with different content now
+gets `409 idempotency_key_reuse` instead of being silently dropped with a `202`.
+ADR-0005. That was the last open Phase 1 exit criterion.
+
+**Key decision:** Length-prefix every field before hashing. Plain concatenation
+would make tenant "ab" + meter "c" hash the same as tenant "a" + meter "bc", so
+two different events could share a fingerprint and a reused key would slip
+through — reintroducing the exact bug. A delimiter doesn't fix it, since any
+byte can appear inside a field. Also decided to canonicalise quantity ("1" and
+"1.0" hash alike), otherwise a client reformatting its retry gets falsely
+accused of reuse.
+
+**Couldn't have written myself yet:** That the fingerprint returned by
+`ON CONFLICT DO UPDATE ... RETURNING` is the *stored* one, not the one just
+offered — because the no-op `SET` touches only `tenant_id`, every other column
+in the returned row still holds its original value. That property is what makes
+reuse detectable in a single statement.
