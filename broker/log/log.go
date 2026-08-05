@@ -18,12 +18,47 @@ import (
 // quick and large enough that rolling is rare.
 const DefaultMaxSegmentBytes = 64 << 20
 
+// SyncPolicy decides when Append forces data to durable storage.
+//
+// This is the durability/throughput dial, and there is no free setting. See
+// ADR-0007 for the measured cost of each.
+type SyncPolicy int
+
+const (
+	// SyncNever leaves flushing to the operating system. Records survive this
+	// process being killed, because the page cache belongs to the kernel, but
+	// not the machine losing power. This is Kafka's default, and Kafka gets
+	// away with it by having replicas on other machines -- which this log does
+	// not.
+	SyncNever SyncPolicy = iota
+
+	// SyncAlways fsyncs on every append. A record is on disk before Append
+	// returns, so an acknowledged write survives power loss. Costs roughly two
+	// orders of magnitude in throughput.
+	SyncAlways
+
+	// SyncEveryN fsyncs once per N appends, bounding how much can be lost to
+	// power failure without paying per record. The exposure is up to N records.
+	SyncEveryN
+)
+
 // Options configures a Log.
 type Options struct {
 	// MaxSegmentBytes is the size at which the active segment is closed and a
 	// new one started. Zero means DefaultMaxSegmentBytes.
 	MaxSegmentBytes int64
+
+	// Sync selects the durability policy. Zero value is SyncNever.
+	Sync SyncPolicy
+
+	// SyncEveryNRecords is the batch size for SyncEveryN. Zero means
+	// DefaultSyncEveryNRecords.
+	SyncEveryNRecords int
 }
+
+// DefaultSyncEveryNRecords bounds power-loss exposure to a few hundred records
+// under SyncEveryN.
+const DefaultSyncEveryNRecords = 100
 
 // Log is an append-only sequence of records addressed by offset.
 //
@@ -42,6 +77,9 @@ type Log struct {
 	// Ordered by baseOffset. The last element is the active segment, the only
 	// one that accepts writes.
 	segments []*segment
+
+	// Counts appends since the last fsync, for SyncEveryN.
+	sinceSync int
 }
 
 // Open opens the log in dir, creating the directory and a first segment if
@@ -55,6 +93,9 @@ type Log struct {
 func Open(dir string, opts Options) (*Log, error) {
 	if opts.MaxSegmentBytes <= 0 {
 		opts.MaxSegmentBytes = DefaultMaxSegmentBytes
+	}
+	if opts.SyncEveryNRecords <= 0 {
+		opts.SyncEveryNRecords = DefaultSyncEveryNRecords
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -134,7 +175,7 @@ func (l *Log) Append(payload []byte) (uint64, error) {
 	// endless sequence of empty segments -- it goes into a fresh segment on
 	// its own and overshoots, which is the lesser problem.
 	recordSize := int64(recordHeaderSize + len(payload))
-	if len(active.positions) > 0 && active.size+recordSize > l.opts.MaxSegmentBytes {
+	if active.nextOffset > active.baseOffset && active.size+recordSize > l.opts.MaxSegmentBytes {
 		next, err := createSegment(l.dir, active.nextOffset)
 		if err != nil {
 			return 0, err
@@ -143,7 +184,33 @@ func (l *Log) Append(payload []byte) (uint64, error) {
 		active = next
 	}
 
-	return active.append(payload)
+	offset, err := active.append(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	// CRITICAL: the sync happens before Append returns, so the durability the
+	// policy promises is a property of the returned offset. Syncing after
+	// returning would mean the caller has been told a record is safe while it
+	// is still only in the page cache -- which is exactly the lie this dial
+	// exists to make explicit.
+	l.sinceSync++
+	switch l.opts.Sync {
+	case SyncAlways:
+		if err := active.sync(); err != nil {
+			return 0, fmt.Errorf("sync after append: %w", err)
+		}
+		l.sinceSync = 0
+	case SyncEveryN:
+		if l.sinceSync >= l.opts.SyncEveryNRecords {
+			if err := active.sync(); err != nil {
+				return 0, fmt.Errorf("sync after append: %w", err)
+			}
+			l.sinceSync = 0
+		}
+	}
+
+	return offset, nil
 }
 
 // Read returns the payload stored at offset.

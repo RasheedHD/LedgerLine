@@ -118,3 +118,24 @@ before delivering the kill and Go retries short writes internally. A torn record
 needs power loss, not process death — which is exactly the distinction fsync is
 about, and the reason the truncation test is the one that actually exercises
 repair.
+
+## 2026-08-03 (cont.) — sparse index and the fsync numbers
+
+**What we built:** The sparse offset index (one entry per 4 KiB, not per
+record — 71 entries for 4000 records) and the fsync dial, both benchmarked.
+Phase 2 done: 30 tests. ADR-0007.
+
+**Key decision:** Default stays `SyncNever` and the dial is exposed, because a
+log is a component and durability is the caller's call. The number that decided
+it: `SyncAlways` costs **244×** — 3.2 ms per append, ~312 appends/sec —
+while `SyncEveryN(1000)` costs only 1.5×. Also learned why Kafka can default to
+no-fsync and we can't: Kafka's durability comes from replicas on other machines,
+and this log has none.
+
+**Couldn't have written myself yet:** Two things. That a sparse index moves cost
+onto the *read* path rather than being a pure memory win — my first version did
+one syscall per record header while scanning, ~57 per read; buffering the
+interval took reads from 86 µs to 33 µs. And that `SyncEveryN` is not a
+durability policy at all for an API that acknowledges: records 1–999 return
+before any sync happens. The real answer is group commit, where concurrent
+appends wait on one shared fsync.

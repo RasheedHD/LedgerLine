@@ -145,12 +145,12 @@ Target shape at project completion:
 | Path | Responsibility | Status |
 |---|---|---|
 | `cmd/ingest/` | Process entry point, DB wiring, HTTP server | Skeleton exists |
-| `billing/ingest/` | HTTP handler, decode, validate | Minimal, no validation |
-| `billing/dedup/` | Idempotency and deduplication | Empty |
+| `billing/ingest/` | HTTP handler, decode, validate | Done: validation, idempotency, fingerprinting |
+| `billing/dedup/` | Idempotency and deduplication | Enforced in `billing/ingest` + the DB constraint; no separate package |
 | `billing/pricing/` | Meters, plans, rating | Empty |
 | `billing/ledger/` | Double-entry posting | Empty |
-| `broker/log/` | Segment format, offset index, recovery | Framing, segments, recovery done; index and fsync pending |
-| `bench/` | Throughput and latency benchmarks | Empty |
+| `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
+| `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
 | `chaos/` | Fault injection, invariant assertions | Empty |
 | `migrations/` | golang-migrate SQL | 1 migration |
 | `docs/adr/` | Design decisions | 3 ADRs |
@@ -335,11 +335,11 @@ durability guarantee `Append` returns; index density.
       what exercises the repair path. See ADR-0006.
 - [x] Deliberately corrupt a byte in a segment → the reader detects it via CRC
       rather than returning garbage
-- [ ] Read from an arbitrary offset without scanning the whole segment
-      *(works, but via a dense in-memory table — the sparse on-disk index is
-      still to build)*
-- [ ] Benchmark: appends/sec at each fsync policy, so the tradeoff is a number
-      you measured, not a claim you repeated
+- [x] Read from an arbitrary offset without scanning the whole segment —
+      sparse on-disk index, 71 entries for 4000 records
+- [x] Benchmark: appends/sec at each fsync policy, so the tradeoff is a number
+      you measured, not a claim you repeated. **`SyncAlways` costs 244×**
+      (~312 appends/sec); `SyncEveryN(1000)` costs 1.5×. See ADR-0007.
 
 **Prepares you to answer:** *How does Kafka store messages on disk? What does
 `fsync` actually guarantee, and what does it not? How do you detect a torn
@@ -590,8 +590,10 @@ Append-only. Close items by marking them, not deleting them.
 | **D19** | Integration tests skip silently without a database, so a green `go test ./...` can prove nothing. CI must assert they ran | code | 8 |
 | **D20** | Docker Desktop leaves undeletable stale socket reparse points on unclean exit, blocking every subsequent start. Cleared by renaming `%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine` | env | — |
 | **D21** | `go test -race` cannot run locally — the installed gcc is 32-bit only (`sorry, unimplemented: 64-bit mode not compiled in`). The log's concurrency is covered by a distinct-offsets test instead, which is weaker. CI on Linux would close this | env | 8 |
-| **D22** | The log's position table is **dense in memory** — 8 bytes per record, ~800 MB at 100M records — and forces a full scan of every segment on open, not just the active one. The sparse on-disk index replaces it | ADR-0006 | 2 |
-| **D23** | `Append` does not fsync, so the log is process-crash safe but **not power-loss safe**. Needs the fsync policy ADR with measured numbers | ADR-0006 | 2 |
+| ~~D22~~ | ~~Dense in-memory position table~~ — **closed 2026-08-03.** Sparse on-disk index, 71 entries per 4000 records; open scales with segment count not record count | ADR-0007 | 2 |
+| ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
+| **D26** | **`SyncEveryN` acknowledges records before they are durable** — with N=1000, records 1-999 return from `Append` with no sync behind them. Once ingest returns `202` on a log append this breaks **I3**. Fix is group commit (concurrent appends wait on one shared fsync), not a bigger N. Until then only `SyncAlways` satisfies I3, at 312 appends/sec | ADR-0007 | 3 |
+| **D27** | `indexIntervalBytes` is a fixed 4 KiB, untuned. A log of tiny records scans ~500 per read; a log of large records indexes every one | ADR-0007 | 7 |
 | **D24** | The log grows without bound; no segment retention or deletion | ADR-0006 | 2 |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
 
@@ -607,6 +609,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0004](docs/adr/0004-ingest-api-contract.md) | The POST /events contract | Accepted |
 | [0005](docs/adr/0005-payload-fingerprint.md) | Detecting a reused idempotency key | Accepted |
 | [0006](docs/adr/0006-segment-format.md) | Segment format and record framing | Accepted |
+| [0007](docs/adr/0007-index-and-durability.md) | Sparse offset index and the fsync policy | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -655,26 +658,26 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phase 1 is complete.** Every exit criterion is ticked and every correctness
-item in ingest is closed. D7 is deferred to Phase 7 with reasoning recorded in
-the debt register — it is an optimisation awaiting evidence, not a missing
-guarantee.
+**Phase 2 is complete.** Framing, segments, recovery, the sparse index, and a
+measured fsync dial are all done and tested (30 tests in `broker/log`).
 
-**Phase 2 is half done.** Framing, segments, append/read, rolling, and crash
-recovery all work and are tested ([ADR-0006](docs/adr/0006-segment-format.md)).
-Two pieces remain, in this order:
+**Next: Phase 3, the seam.** Ingest stops writing to Postgres directly and
+appends to the log; a consumer drains the log into Postgres. This is where the
+thesis sentence stops being theoretical, and it has three parts that must be
+done in order:
 
-1. **The sparse on-disk index (D22).** Today reads are O(1) but via a *dense
-   in-memory* table costing 8 bytes per record, and every segment must be
-   scanned on open to rebuild it. A sparse index — an entry every N records,
-   seek to the nearest and scan forward — is the actual Kafka design and the
-   reason it can hold far more than fits in memory.
-2. **The fsync policy (D23).** The durability/throughput dial: every append,
-   batched with a window, or never. This is the one decision in the project
-   that should be settled with **measured numbers**, so it needs `bench/`
-   started early rather than waiting for Phase 7. Until it lands, the log is
-   process-crash safe but not power-loss safe.
-
-Then Phase 3, the seam: ingest appends to the log, a consumer drains it, and
-`received_at` moves from the Postgres insert to the log append — which is a
-semantic change to the field the entire late-event policy rests on.
+1. **Group commit (D26) — before anything else.** `SyncEveryN` currently
+   acknowledges records that are not yet durable, so the moment ingest returns
+   `202` on the strength of a log append, **I3 is broken**. Concurrent appends
+   must wait on one shared fsync. Without this, Phase 3 builds a correctness
+   hole into the seam by construction.
+2. **`received_at` moves.** ADR-0001 defines it as "when we took durable
+   custody." That becomes the log append rather than the Postgres insert — a
+   semantic change to the field the entire late-event policy rests on, so it
+   needs an ADR amendment rather than a quiet edit.
+3. **The consumer and its offset.** Committing the offset before processing
+   gives at-most-once (loses events, breaks I3); after gives at-least-once
+   (duplicates, absorbed by the dedup already built). That choice *is* the
+   delivery semantics, and the crash test for it — kill between processing and
+   commit, assert the ledger is unchanged — is the money test of the whole
+   project.
