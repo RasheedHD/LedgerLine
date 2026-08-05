@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -44,6 +45,57 @@ func BenchmarkAppend(b *testing.B) {
 				if _, err := l.Append(benchPayload); err != nil {
 					b.Fatalf("append: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// BenchmarkAppendParallel is the benchmark group commit exists for.
+//
+// Serially, SyncGroup and SyncAlways are the same thing: one writer, one fsync,
+// one record. The difference only appears under concurrency, which is also the
+// only condition that matters -- an ingest endpoint serving one request at a
+// time is not a system anyone needs.
+//
+// SyncAlways should stay pinned near its serial rate no matter how many writers
+// arrive, because each pays for its own flush. SyncGroup should climb, because
+// the writers that queue during one flush all become durable together.
+func BenchmarkAppendParallel(b *testing.B) {
+	policies := []struct {
+		name string
+		opts Options
+	}{
+		{"SyncNever", Options{Sync: SyncNever}},
+		{"SyncAlways", Options{Sync: SyncAlways}},
+		{"SyncGroup", Options{Sync: SyncGroup}},
+	}
+
+	for _, p := range policies {
+		b.Run(p.name, func(b *testing.B) {
+			l, err := Open(b.TempDir(), p.opts)
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			defer l.Close()
+
+			// 64 concurrent writers, roughly what a busy ingest endpoint looks
+			// like. The default of one goroutine per CPU would understate the
+			// batching that group commit is built to exploit.
+			b.SetParallelism(64 / max(1, runtime.GOMAXPROCS(0)))
+			b.SetBytes(int64(len(benchPayload)))
+			b.ResetTimer()
+
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, err := l.Append(benchPayload); err != nil {
+						b.Fatalf("append: %v", err)
+					}
+				}
+			})
+
+			b.StopTimer()
+			if syncs := l.SyncCount(); syncs > 0 {
+				b.ReportMetric(float64(b.N)/float64(syncs), "records/fsync")
 			}
 		})
 	}

@@ -39,7 +39,20 @@ const (
 
 	// SyncEveryN fsyncs once per N appends, bounding how much can be lost to
 	// power failure without paying per record. The exposure is up to N records.
+	//
+	// Note carefully: this acknowledges records that are not yet durable. With
+	// N = 1000, records 1 through 999 return from Append with no sync behind
+	// them. It is safe where losing a bounded tail is acceptable, and unsafe as
+	// the basis for acknowledging a client. Use SyncGroup for that.
 	SyncEveryN
+
+	// SyncGroup makes concurrent appends wait on one shared fsync. Every
+	// acknowledgement is backed by a completed sync, as with SyncAlways, but
+	// the cost is divided among everyone flushing together, so throughput rises
+	// with concurrency instead of being capped by one fsync per record.
+	//
+	// This is the policy an acknowledging API wants. See ADR-0008.
+	SyncGroup
 )
 
 // Options configures a Log.
@@ -80,6 +93,12 @@ type Log struct {
 
 	// Counts appends since the last fsync, for SyncEveryN.
 	sinceSync int
+
+	// Monotonic sequence per append, used to order writers against syncs.
+	seq uint64
+
+	// Coordinates group commit. Always non-nil; unused under other policies.
+	syncer *syncCoordinator
 }
 
 // Open opens the log in dir, creating the directory and a first segment if
@@ -107,7 +126,7 @@ func Open(dir string, opts Options) (*Log, error) {
 		return nil, err
 	}
 
-	l := &Log{dir: dir, opts: opts}
+	l := &Log{dir: dir, opts: opts, syncer: newSyncCoordinator()}
 
 	for _, baseOffset := range baseOffsets {
 		s, err := openSegment(filepath.Join(dir, segmentName(baseOffset)))
@@ -160,12 +179,15 @@ func listSegmentOffsets(dir string) ([]uint64, error) {
 
 // Append stores payload and returns the offset it was written at.
 //
-// The returned offset is durable only to the extent Sync has been called. See
-// ADR-0006: on return the record has been handed to the operating system, which
-// survives this process dying but not the machine losing power.
+// What durability the returned offset carries depends entirely on Options.Sync:
+//
+//   - SyncNever and SyncEveryN: the record has been handed to the operating
+//     system. It survives this process dying but not the machine losing power.
+//     SyncEveryN in particular returns for most records with no sync behind
+//     them at all.
+//   - SyncAlways and SyncGroup: the record is on disk before this returns.
 func (l *Log) Append(payload []byte) (uint64, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	active := l.segments[len(l.segments)-1]
 
@@ -176,8 +198,21 @@ func (l *Log) Append(payload []byte) (uint64, error) {
 	// its own and overshoots, which is the lesser problem.
 	recordSize := int64(recordHeaderSize + len(payload))
 	if active.nextOffset > active.baseOffset && active.size+recordSize > l.opts.MaxSegmentBytes {
+		// The outgoing segment is flushed as part of rolling, so that group
+		// commit only ever has to think about the active one. Without this a
+		// waiter whose record landed in a previous segment could be woken by a
+		// sync that never touched the file its record is in.
+		if l.opts.Sync != SyncNever {
+			if err := active.sync(); err != nil {
+				l.mu.Unlock()
+				return 0, fmt.Errorf("sync on segment roll: %w", err)
+			}
+			l.syncer.markSynced(l.seq)
+		}
+
 		next, err := createSegment(l.dir, active.nextOffset)
 		if err != nil {
+			l.mu.Unlock()
 			return 0, err
 		}
 		l.segments = append(l.segments, next)
@@ -186,31 +221,71 @@ func (l *Log) Append(payload []byte) (uint64, error) {
 
 	offset, err := active.append(payload)
 	if err != nil {
+		l.mu.Unlock()
 		return 0, err
 	}
 
-	// CRITICAL: the sync happens before Append returns, so the durability the
-	// policy promises is a property of the returned offset. Syncing after
-	// returning would mean the caller has been told a record is safe while it
-	// is still only in the page cache -- which is exactly the lie this dial
-	// exists to make explicit.
+	// Sequence numbers order appends for the sync coordinator. Distinct from
+	// offsets only because they must keep counting across segment boundaries
+	// without being confused with the log's addressing.
+	l.seq++
+	seq := l.seq
+
 	l.sinceSync++
+	sinceSync := l.sinceSync
+	if l.opts.Sync == SyncEveryN && sinceSync >= l.opts.SyncEveryNRecords {
+		l.sinceSync = 0
+	}
+
+	// CRITICAL: the lock is released before any fsync.
+	//
+	// Group commit only works if other writers can append while one of them is
+	// flushing -- the batch a single sync covers is exactly the set of writers
+	// that arrived during the previous flush. Holding the log lock across the
+	// sync would serialise appends behind it and reduce group commit to
+	// SyncAlways with extra machinery.
+	l.mu.Unlock()
+
 	switch l.opts.Sync {
 	case SyncAlways:
-		if err := active.sync(); err != nil {
+		if err := l.syncActive(); err != nil {
 			return 0, fmt.Errorf("sync after append: %w", err)
 		}
-		l.sinceSync = 0
 	case SyncEveryN:
-		if l.sinceSync >= l.opts.SyncEveryNRecords {
-			if err := active.sync(); err != nil {
+		if sinceSync >= l.opts.SyncEveryNRecords {
+			if err := l.syncActive(); err != nil {
 				return 0, fmt.Errorf("sync after append: %w", err)
 			}
-			l.sinceSync = 0
+		}
+	case SyncGroup:
+		if err := l.syncer.waitFor(seq, l.syncActive); err != nil {
+			return 0, fmt.Errorf("group sync after append: %w", err)
 		}
 	}
 
 	return offset, nil
+}
+
+// syncActive flushes the segment currently accepting writes.
+func (l *Log) syncActive() error {
+	l.mu.RLock()
+	if len(l.segments) == 0 {
+		l.mu.RUnlock()
+		return nil
+	}
+	active := l.segments[len(l.segments)-1]
+	l.mu.RUnlock()
+
+	return active.sync()
+}
+
+// SyncCount reports how many fsync calls group commit has actually made.
+//
+// Exposed so tests and benchmarks can demonstrate batching rather than assume
+// it: with group commit under load this should be far below the number of
+// appends.
+func (l *Log) SyncCount() uint64 {
+	return l.syncer.syncCount()
 }
 
 // Read returns the payload stored at offset.

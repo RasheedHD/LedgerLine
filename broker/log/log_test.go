@@ -12,7 +12,12 @@ import (
 
 func openTestLog(t *testing.T, dir string, maxSegmentBytes int64) *Log {
 	t.Helper()
-	l, err := Open(dir, Options{MaxSegmentBytes: maxSegmentBytes})
+	return openTestLogWith(t, dir, Options{MaxSegmentBytes: maxSegmentBytes})
+}
+
+func openTestLogWith(t *testing.T, dir string, opts Options) *Log {
+	t.Helper()
+	l, err := Open(dir, opts)
 	if err != nil {
 		t.Fatalf("open log: %v", err)
 	}

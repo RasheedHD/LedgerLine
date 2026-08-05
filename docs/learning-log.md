@@ -139,3 +139,25 @@ interval took reads from 86 µs to 33 µs. And that `SyncEveryN` is not a
 durability policy at all for an API that acknowledges: records 1–999 return
 before any sync happens. The real answer is group commit, where concurrent
 appends wait on one shared fsync.
+
+## 2026-08-03 (cont.) — group commit
+
+**What we built:** `SyncGroup`. Concurrent appends wait on one shared fsync, so
+every acknowledgement is backed by a completed flush without each writer paying
+for its own. Closes D26, which gated Phase 3. ADR-0008. 35 tests in broker/log.
+
+**Key decision:** Release the log lock *before* the fsync. Group commit only
+works if other writers can append while one is flushing — the batch a sync
+covers is exactly the writers who arrived during the previous flush. Holding the
+lock across the sync turns group commit back into `SyncAlways` with extra
+machinery. Measured: 7.2× `SyncAlways` at 64 writers, ~16 records per fsync,
+same durability guarantee.
+
+**Couldn't have written myself yet:** That the syncer must capture the highest
+written sequence *before* calling fsync and claim only that much afterwards.
+Records written while the flush is in flight may not have been caught by it, so
+marking them durable would reintroduce the exact bug in a subtler place. There's
+a test where one writer blocks inside the flush and a second arrives mid-sync,
+asserting the second is not satisfied by the first's sync. Also learned that
+`SyncAlways` gains *nothing* from concurrency — 308/sec at 64 writers vs 312/sec
+at one — because throughput there is a property of the disk, not the workload.

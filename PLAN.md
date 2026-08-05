@@ -592,7 +592,8 @@ Append-only. Close items by marking them, not deleting them.
 | **D21** | `go test -race` cannot run locally — the installed gcc is 32-bit only (`sorry, unimplemented: 64-bit mode not compiled in`). The log's concurrency is covered by a distinct-offsets test instead, which is weaker. CI on Linux would close this | env | 8 |
 | ~~D22~~ | ~~Dense in-memory position table~~ — **closed 2026-08-03.** Sparse on-disk index, 71 entries per 4000 records; open scales with segment count not record count | ADR-0007 | 2 |
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
-| **D26** | **`SyncEveryN` acknowledges records before they are durable** — with N=1000, records 1-999 return from `Append` with no sync behind them. Once ingest returns `202` on a log append this breaks **I3**. Fix is group commit (concurrent appends wait on one shared fsync), not a bigger N. Until then only `SyncAlways` satisfies I3, at 312 appends/sec | ADR-0007 | 3 |
+| ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
+| **D28** | `SyncEveryN` is still in the API and still unsafe behind an acknowledgement; nothing in the type system prevents that mistake. A `Durable() bool` on the policy, or splitting the enum, would | ADR-0008 | 8 |
 | **D27** | `indexIntervalBytes` is a fixed 4 KiB, untuned. A log of tiny records scans ~500 per read; a log of large records indexes every one | ADR-0007 | 7 |
 | **D24** | The log grows without bound; no segment retention or deletion | ADR-0006 | 2 |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
@@ -610,6 +611,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0005](docs/adr/0005-payload-fingerprint.md) | Detecting a reused idempotency key | Accepted |
 | [0006](docs/adr/0006-segment-format.md) | Segment format and record framing | Accepted |
 | [0007](docs/adr/0007-index-and-durability.md) | Sparse offset index and the fsync policy | Accepted |
+| [0008](docs/adr/0008-group-commit.md) | Group commit | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -666,11 +668,9 @@ appends to the log; a consumer drains the log into Postgres. This is where the
 thesis sentence stops being theoretical, and it has three parts that must be
 done in order:
 
-1. **Group commit (D26) — before anything else.** `SyncEveryN` currently
-   acknowledges records that are not yet durable, so the moment ingest returns
-   `202` on the strength of a log append, **I3 is broken**. Concurrent appends
-   must wait on one shared fsync. Without this, Phase 3 builds a correctness
-   hole into the seam by construction.
+1. ~~**Group commit (D26).**~~ **Done** — `SyncGroup` lands every
+   acknowledgement behind a completed fsync, at 7.2× `SyncAlways` under 64
+   concurrent writers. ADR-0008.
 2. **`received_at` moves.** ADR-0001 defines it as "when we took durable
    custody." That becomes the log append rather than the Postgres insert — a
    semantic change to the field the entire late-event policy rests on, so it
