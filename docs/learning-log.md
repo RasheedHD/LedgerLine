@@ -97,3 +97,24 @@ accused of reuse.
 offered — because the no-op `SET` touches only `tenant_id`, every other column
 in the returned row still holds its original value. That property is what makes
 reuse detectable in a single statement.
+
+## 2026-08-03 (cont.) — broker/log: framing, segments, recovery
+
+**What we built:** The append-only log. Length+CRC32C record framing, segment
+files with a magic/version header rolling at 64 MiB, offset-addressed reads,
+and crash recovery that truncates a damaged tail. 25 tests including a real
+`kill -9` of a child process mid-append. ADR-0006.
+
+**Key decision:** The checksum covers the *length field*, not just the payload.
+Checksumming only the payload leaves the length unprotected — and a flipped bit
+there doesn't corrupt one record, it desynchronises the reader from the whole
+stream so every following record is read from the wrong position. Covering the
+length keeps the failure local. There's a test that fails if you exclude it.
+
+**Couldn't have written myself yet:** That `kill -9` *cannot* produce a torn
+record. I assumed it would. Measured across repeated runs: the tail always ends
+on a clean record boundary, because the kernel finishes the `WriteAt` syscall
+before delivering the kill and Go retries short writes internally. A torn record
+needs power loss, not process death — which is exactly the distinction fsync is
+about, and the reason the truncation test is the one that actually exercises
+repair.

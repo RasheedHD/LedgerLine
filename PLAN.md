@@ -149,7 +149,7 @@ Target shape at project completion:
 | `billing/dedup/` | Idempotency and deduplication | Empty |
 | `billing/pricing/` | Meters, plans, rating | Empty |
 | `billing/ledger/` | Double-entry posting | Empty |
-| `broker/log/` | Segment format, offset index, recovery | Empty |
+| `broker/log/` | Segment format, offset index, recovery | Framing, segments, recovery done; index and fsync pending |
 | `bench/` | Throughput and latency benchmarks | Empty |
 | `chaos/` | Fault injection, invariant assertions | Empty |
 | `migrations/` | golang-migrate SQL | 1 migration |
@@ -326,12 +326,18 @@ durability guarantee `Append` returns; index density.
 
 **Exit criteria:**
 
-- [ ] Write 100k records, close, reopen, read all back identical
-- [ ] `kill -9` mid-append → reopen succeeds, every acked record is present,
-      no partial record is ever returned to a reader
-- [ ] Deliberately corrupt a byte in a segment → the reader detects it via CRC
+- [x] Write records, close, reopen, read all back identical
+- [x] `kill -9` mid-append → reopen succeeds, every acked record is present,
+      no partial record is ever returned to a reader. **Measured finding: a
+      SIGKILL cannot actually tear a record** — the kernel completes the
+      `WriteAt` syscall before delivering the signal. Torn records need power
+      loss. `TestRecoversFromTornTail` constructs the damage directly and is
+      what exercises the repair path. See ADR-0006.
+- [x] Deliberately corrupt a byte in a segment → the reader detects it via CRC
       rather than returning garbage
 - [ ] Read from an arbitrary offset without scanning the whole segment
+      *(works, but via a dense in-memory table — the sparse on-disk index is
+      still to build)*
 - [ ] Benchmark: appends/sec at each fsync policy, so the tradeoff is a number
       you measured, not a claim you repeated
 
@@ -583,6 +589,10 @@ Append-only. Close items by marking them, not deleting them.
 | **D18** | Every duplicate writes a dead tuple via the no-op `DO UPDATE`; autovacuum work scales with duplicate volume | ADR-0004 | 1 |
 | **D19** | Integration tests skip silently without a database, so a green `go test ./...` can prove nothing. CI must assert they ran | code | 8 |
 | **D20** | Docker Desktop leaves undeletable stale socket reparse points on unclean exit, blocking every subsequent start. Cleared by renaming `%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine` | env | — |
+| **D21** | `go test -race` cannot run locally — the installed gcc is 32-bit only (`sorry, unimplemented: 64-bit mode not compiled in`). The log's concurrency is covered by a distinct-offsets test instead, which is weaker. CI on Linux would close this | env | 8 |
+| **D22** | The log's position table is **dense in memory** — 8 bytes per record, ~800 MB at 100M records — and forces a full scan of every segment on open, not just the active one. The sparse on-disk index replaces it | ADR-0006 | 2 |
+| **D23** | `Append` does not fsync, so the log is process-crash safe but **not power-loss safe**. Needs the fsync policy ADR with measured numbers | ADR-0006 | 2 |
+| **D24** | The log grows without bound; no segment retention or deletion | ADR-0006 | 2 |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
 
 ---
@@ -596,6 +606,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0003](docs/adr/0003-postgres-driver.md) | pgx as the Postgres driver, used through database/sql | Accepted |
 | [0004](docs/adr/0004-ingest-api-contract.md) | The POST /events contract | Accepted |
 | [0005](docs/adr/0005-payload-fingerprint.md) | Detecting a reused idempotency key | Accepted |
+| [0006](docs/adr/0006-segment-format.md) | Segment format and record framing | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -649,18 +660,21 @@ item in ingest is closed. D7 is deferred to Phase 7 with reasoning recorded in
 the debt register — it is an optimisation awaiting evidence, not a missing
 guarantee.
 
-**Next: Phase 2, `broker/log/`** — the append-only log. The biggest single
-piece in the project and the one the distributed-systems half of the thesis
-rests on. In order:
+**Phase 2 is half done.** Framing, segments, append/read, rolling, and crash
+recovery all work and are tested ([ADR-0006](docs/adr/0006-segment-format.md)).
+Two pieces remain, in this order:
 
-1. **Segment format** — length-prefixed records, CRC32 per record, magic and
-   version in the segment header. Get the framing right before anything is
-   written on top of it.
-2. **Append and read** — the smallest API that works: `Append([]byte) (offset,
-   error)` and `Read(offset)`.
-3. **Recovery on open** — scan the tail, find the last record with a valid CRC,
-   truncate the rest. This is where crash safety actually lives, and it is
-   worth writing the crash test before the recovery code.
-4. **Sparse offset index** — so reads seek near rather than scanning from zero.
-5. **fsync policy** — the durability/throughput dial, and the decision that
-   deserves its own ADR with measured numbers rather than a repeated claim.
+1. **The sparse on-disk index (D22).** Today reads are O(1) but via a *dense
+   in-memory* table costing 8 bytes per record, and every segment must be
+   scanned on open to rebuild it. A sparse index — an entry every N records,
+   seek to the nearest and scan forward — is the actual Kafka design and the
+   reason it can hold far more than fits in memory.
+2. **The fsync policy (D23).** The durability/throughput dial: every append,
+   batched with a window, or never. This is the one decision in the project
+   that should be settled with **measured numbers**, so it needs `bench/`
+   started early rather than waiting for Phase 7. Until it lands, the log is
+   process-crash safe but not power-loss safe.
+
+Then Phase 3, the seam: ingest appends to the log, a consumer drains it, and
+`received_at` moves from the Postgres insert to the log append — which is a
+semantic change to the field the entire late-event policy rests on.
