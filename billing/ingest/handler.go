@@ -12,6 +12,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/RasheedHD/LedgerLine/billing/event"
 )
 
 // A request body large enough for any legitimate single event and small enough
@@ -126,7 +128,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// policy is built on sand.
 	receivedAt := h.now().UTC()
 
-	offered := fingerprint(req)
+	// The fingerprint is defined in billing/event, next to the type it hashes,
+	// so ingest and the consumer cannot drift apart on what "the same payload"
+	// means.
+	offered := event.Fingerprint(&event.UsageEvent{
+		TenantID:   req.TenantID,
+		Meter:      req.Meter,
+		Quantity:   req.Quantity,
+		OccurredAt: req.OccurredAt,
+	})
 
 	var id int64
 	var inserted bool

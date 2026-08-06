@@ -23,10 +23,49 @@ import (
 // The schema is dropped and rebuilt on first use, so pointing this at the dev
 // database would destroy whatever is in it.
 const (
-	adminDSN = "postgres://ledgerline:ledgerline@localhost:5432/ledgerline?sslmode=disable"
-	testDSN  = "postgres://ledgerline:ledgerline@localhost:5432/ledgerline_test?sslmode=disable"
-	testName = "ledgerline_test"
+	adminDSN   = "postgres://ledgerline:ledgerline@localhost:5432/ledgerline?sslmode=disable"
+	dsnPrefix  = "postgres://ledgerline:ledgerline@localhost:5432/"
+	dsnSuffix  = "?sslmode=disable"
+	namePrefix = "ledgerline_test"
 )
+
+// CRITICAL: each package under test gets its own database.
+//
+// `go test ./...` compiles one binary per package and runs them in PARALLEL.
+// Sharing a single test database means two binaries drop and rebuild the schema
+// underneath each other -- which showed up as tables vanishing mid-test and row
+// counts from one package's fixtures appearing in another's assertions.
+//
+// Naming the database after the package keeps them isolated without giving up
+// parallelism, and keeps the name readable when inspecting one by hand.
+func testDatabaseName(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+
+	root := repoRoot(t)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		t.Fatalf("relative package path: %v", err)
+	}
+
+	// Postgres identifiers are case-folded and cannot contain separators.
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		default:
+			return '_'
+		}
+	}, rel)
+
+	return namePrefix + "_" + safe
+}
 
 // schemaOnce guards the drop-and-rebuild so it happens once per test binary
 // rather than once per test. Individual tests get isolation from truncation,
@@ -45,10 +84,11 @@ func New(t *testing.T) *sql.DB {
 
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		if !ensureDatabaseExists(t) {
+		name := testDatabaseName(t)
+		if !ensureDatabaseExists(t, name) {
 			return nil
 		}
-		dsn = testDSN
+		dsn = dsnPrefix + name + dsnSuffix
 	}
 
 	db, err := sql.Open("pgx", dsn)
@@ -67,10 +107,10 @@ func New(t *testing.T) *sql.DB {
 	return db
 }
 
-// ensureDatabaseExists creates ledgerline_test if it is not already there,
-// connecting via the main database to do it. Returns false if the server is
-// unreachable, having already skipped the test.
-func ensureDatabaseExists(t *testing.T) bool {
+// ensureDatabaseExists creates this package's test database if it is not
+// already there, connecting via the main database to do it. Returns false if
+// the server is unreachable, having already skipped the test.
+func ensureDatabaseExists(t *testing.T, name string) bool {
 	t.Helper()
 
 	admin, err := sql.Open("pgx", adminDSN)
@@ -85,7 +125,7 @@ func ensureDatabaseExists(t *testing.T) bool {
 	}
 
 	var exists bool
-	err = admin.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", testName).Scan(&exists)
+	err = admin.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
 	if err != nil {
 		t.Fatalf("check for test database: %v", err)
 	}
@@ -94,9 +134,16 @@ func ensureDatabaseExists(t *testing.T) bool {
 	}
 
 	// CREATE DATABASE cannot run inside a transaction block and cannot take a
-	// placeholder for the name, so this is string-interpolated. Safe only
-	// because testName is a compile-time constant.
-	if _, err := admin.Exec("CREATE DATABASE " + testName); err != nil {
+	// placeholder for the name, so this is string-interpolated. The name is
+	// built from a filesystem path reduced to [a-z0-9_] by testDatabaseName,
+	// so there is nothing left that could alter the statement.
+	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+		// Two packages starting at once can both see it missing and both try
+		// to create it. Losing that race is fine -- the database exists, which
+		// is all this function is for.
+		if strings.Contains(err.Error(), "already exists") {
+			return true
+		}
 		t.Fatalf("create test database: %v", err)
 	}
 	return true
@@ -194,9 +241,14 @@ func migrationFiles(t *testing.T, dir, suffix string, reverse bool) []string {
 	return paths
 }
 
-// migrationsDir walks up from the test's working directory looking for go.mod,
-// so this works regardless of which package's directory `go test` ran from.
 func migrationsDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(repoRoot(t), "migrations")
+}
+
+// repoRoot walks up from the test's working directory looking for go.mod, so
+// this works regardless of which package's directory `go test` ran from.
+func repoRoot(t *testing.T) string {
 	t.Helper()
 
 	dir, err := os.Getwd()
@@ -205,7 +257,7 @@ func migrationsDir(t *testing.T) string {
 	}
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return filepath.Join(dir, "migrations")
+			return dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {

@@ -5,7 +5,11 @@
 -- keep. Running this down migration means giving up reuse detection for all
 -- existing rows, not merely for new ones.
 --
--- IF EXISTS so a down run against a partially-applied state does not fail and
--- leave schema_migrations dirty.
-ALTER TABLE events
+-- IF EXISTS twice, and both are needed.
+--
+-- `DROP COLUMN IF EXISTS` only guards the column. Without `ALTER TABLE IF
+-- EXISTS` as well, running this against a database where `events` has already
+-- been dropped fails with 42P01 and leaves schema_migrations dirty -- which is
+-- exactly the state a down migration is supposed to be able to clean up.
+ALTER TABLE IF EXISTS events
     DROP COLUMN IF EXISTS payload_fingerprint;
