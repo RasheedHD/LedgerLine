@@ -147,6 +147,8 @@ Target shape at project completion:
 | `cmd/ingest/` | Process entry point, DB wiring, HTTP server | Skeleton exists |
 | `billing/ingest/` | HTTP handler, decode, validate | Done: validation, idempotency, fingerprinting |
 | `billing/dedup/` | Idempotency and deduplication | Enforced in `billing/ingest` + the DB constraint; no separate package |
+| `billing/event/` | Shared wire type, codec, fingerprint | Done |
+| `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
 | `billing/pricing/` | Meters, plans, rating | Empty |
 | `billing/ledger/` | Double-entry posting | Empty |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
@@ -594,6 +596,9 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
 | ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
 | **D28** | `SyncEveryN` is still in the API and still unsafe behind an acknowledgement; nothing in the type system prevents that mistake. A `Durable() bool` on the policy, or splitting the enum, would | ADR-0008 | 8 |
+| **D29** | Consumer conflicts and undecodable records are counted and logged but not stored anywhere actionable. A dead-letter table is what I3 really asks for | ADR-0009 | 3 |
+| **D30** | The consumer runs `Drain` to completion and returns; continuous tailing with backoff is not built | ADR-0009 | 3 |
+| **D31** | **OPEN DECISION.** Once ingest appends to the log it cannot read `events`, so it cannot return `duplicate: true` or `409 idempotency_key_reuse`. Either the ADR-0004/0005 contract is superseded, or ingest keeps a synchronous dedup lookup and gives up the availability the log was added for. Blocks the ingest rewire | ADR-0004, ADR-0005 | 3 |
 | **D27** | `indexIntervalBytes` is a fixed 4 KiB, untuned. A log of tiny records scans ~500 per read; a log of large records indexes every one | ADR-0007 | 7 |
 | **D24** | The log grows without bound; no segment retention or deletion | ADR-0006 | 2 |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
@@ -612,6 +617,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0006](docs/adr/0006-segment-format.md) | Segment format and record framing | Accepted |
 | [0007](docs/adr/0007-index-and-durability.md) | Sparse offset index and the fsync policy | Accepted |
 | [0008](docs/adr/0008-group-commit.md) | Group commit | Accepted |
+| [0009](docs/adr/0009-delivery-semantics.md) | Delivery semantics and where the consumer offset lives | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -671,13 +677,17 @@ done in order:
 1. ~~**Group commit (D26).**~~ **Done** — `SyncGroup` lands every
    acknowledgement behind a completed fsync, at 7.2× `SyncAlways` under 64
    concurrent writers. ADR-0008.
-2. **`received_at` moves.** ADR-0001 defines it as "when we took durable
-   custody." That becomes the log append rather than the Postgres insert — a
-   semantic change to the field the entire late-event policy rests on, so it
-   needs an ADR amendment rather than a quiet edit.
-3. **The consumer and its offset.** Committing the offset before processing
-   gives at-most-once (loses events, breaks I3); after gives at-least-once
-   (duplicates, absorbed by the dedup already built). That choice *is* the
-   delivery semantics, and the crash test for it — kill between processing and
-   commit, assert the ledger is unchanged — is the money test of the whole
-   project.
+2. ~~**The consumer and its offset.**~~ **Done** — the offset lives in Postgres
+   and advances in the same transaction as the inserts, making processing
+   exactly-once rather than at-least-once with cleanup. Replay from offset 0
+   returns every record as a duplicate and does not move the row count.
+   ADR-0009.
+3. **The ingest rewire — BLOCKED on D31.** Ingest appending to the log cannot
+   read `events`, so `duplicate: true` and `409 idempotency_key_reuse` become
+   unanswerable. Either ADR-0004/0005's contract is superseded, or ingest keeps
+   a synchronous dedup lookup and surrenders the availability the log exists to
+   provide. This is a decision, not a task.
+4. **`received_at` moves** (after D31). ADR-0001 defines it as "when we took
+   durable custody." That becomes the log append rather than the Postgres
+   insert — a semantic change to the field the entire late-event policy rests
+   on, so it needs an ADR amendment rather than a quiet edit.

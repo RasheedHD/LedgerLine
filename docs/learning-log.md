@@ -161,3 +161,28 @@ a test where one writer blocks inside the flush and a second arrives mid-sync,
 asserting the second is not satisfied by the first's sync. Also learned that
 `SyncAlways` gains *nothing* from concurrency — 308/sec at 64 writers vs 312/sec
 at one — because throughput there is a property of the disk, not the workload.
+
+## 2026-08-03 (cont.) — the consumer, and exactly-once processing
+
+**What we built:** `billing/event` (shared wire type, JSON codec, fingerprint)
+and `billing/consumer` (drains the log into Postgres), plus migration 000003 for
+`consumer_offsets`. ADR-0009. 112 tests passing, none skipped.
+
+**Key decision:** The offset lives in Postgres and advances in the *same
+transaction* as the inserts it advances past. The textbook choice is
+commit-before (at-most-once, loses events) or commit-after (at-least-once,
+duplicates) — but that framing hides a third option whenever the offset and the
+data share a transactional store. Either both land or neither does, so
+processing is exactly-once. The log still only promises at-least-once
+*delivery*; what changed is the *effect*.
+
+**Couldn't have written myself yet:** Two bugs that only appeared when running
+`go test ./...` instead of one package at a time. Go compiles one binary per
+package and runs them **in parallel**, so every package sharing one test
+database was dropping and rebuilding the schema under the others — tables
+vanishing mid-test, one package's fixtures showing up in another's assertions.
+And migration 000002's down used `ALTER TABLE events DROP COLUMN IF EXISTS`,
+where `IF EXISTS` guards only the *column*; against an already-dropped table it
+failed with 42P01 and left `schema_migrations` dirty, which is exactly the state
+a down migration exists to clean up. It had only ever worked because the shared
+test database always already had the table.
