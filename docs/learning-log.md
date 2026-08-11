@@ -186,3 +186,27 @@ where `IF EXISTS` guards only the *column*; against an already-dropped table it
 failed with 42P01 and left `schema_migrations` dirty, which is exactly the state
 a down migration exists to clean up. It had only ever worked because the shared
 test database always already had the table.
+
+## 2026-08-03 (cont.) — the double-entry ledger
+
+**What we built:** `billing/ledger` — `Amount` as int64 micro-units, balanced-
+by-construction transactions, and a Postgres schema whose deferred constraint
+trigger enforces balance independently of Go. Migration 000004. ADR-0010.
+171 tests across the repo, none skipped.
+
+**Key decision:** The API accepts only `Transfer{Debit, Credit, Amount}`, never
+a bare posting. One transfer necessarily produces one debit and one credit of
+equal size, so a transaction balances *by construction* rather than by a
+validation step some future code path could skip. `Postings()` returns a copy,
+so nobody can unbalance it afterwards. Also chose 6 decimal places, not 2 —
+usage billing prices below a cent, so a ledger in cents rounds every posting to
+zero and bills nothing.
+
+**Couldn't have written myself yet:** Two things. `DEFERRABLE INITIALLY
+DEFERRED` on the constraint trigger — postings land one row at a time, so a
+transaction is unbalanced after its first row; an immediate check rejects every
+legitimate entry, and deferring to COMMIT is the only moment "balanced" is even
+a meaningful question. Proved it by removing DEFERRABLE and watching every
+normal post fail. And that my overflow test was wrong, not the code: postings
+append as +a, -a, +b, -b, so the running total never exceeds the largest single
+transfer and overflow is structurally impossible there.

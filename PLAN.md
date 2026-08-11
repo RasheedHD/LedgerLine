@@ -150,7 +150,7 @@ Target shape at project completion:
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
 | `billing/pricing/` | Meters, plans, rating | Empty |
-| `billing/ledger/` | Double-entry posting | Empty |
+| `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
 | `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
 | `chaos/` | Fault injection, invariant assertions | Empty |
@@ -439,13 +439,15 @@ instead of silently producing a wrong number.
 
 **Exit criteria:**
 
-- [ ] Property test: for any random sequence of postings,
-      `sum(debits) == sum(credits)` (**I1**)
-- [ ] An unbalanced transaction cannot be constructed through the public API
-- [ ] Balance computed from a running total equals balance computed by
-      replaying the journal from zero
-- [ ] Posting the same priced event twice is rejected or is a no-op (I2 at the
-      ledger boundary — defence in depth)
+- [x] Property test: 2000 randomly generated transactions all sum to zero
+      (**I1**), plus `TrialBalance` re-checked after each of 200 posts
+- [x] An unbalanced transaction cannot be constructed through the public API —
+      the only input type is a `Transfer`, which names both sides
+- [x] Balance computed from the journal equals an independently accumulated
+      total
+- [x] Posting the same transaction twice is a no-op (I2 at the ledger boundary)
+- [x] The database refuses an unbalanced entry even when the Go API is bypassed
+      entirely — mutation-checked twice
 
 **Prepares you to answer:** *Why double-entry for a billing system? What does
 it actually buy you over a balance column?*
@@ -618,6 +620,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0007](docs/adr/0007-index-and-durability.md) | Sparse offset index and the fsync policy | Accepted |
 | [0008](docs/adr/0008-group-commit.md) | Group commit | Accepted |
 | [0009](docs/adr/0009-delivery-semantics.md) | Delivery semantics and where the consumer offset lives | Accepted |
+| [0010](docs/adr/0010-double-entry-ledger.md) | The double-entry ledger | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
