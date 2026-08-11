@@ -230,3 +230,27 @@ byte-identical result. Also that my float-guard test was wrong before the code
 was: a byte search for "float64" failed on three *comments* explaining why float
 is avoided. Parsing the AST fixes it, because comments aren't in the tree unless
 you ask for them.
+
+## 2026-08-11 — D31 resolved: ingest appends to the log
+
+**What we built:** Rewired ingest off Postgres and onto the broker log. It now
+validates, appends, and returns `202 {"offset": N}` — no `duplicate` flag, no
+`409`. Dedup stays downstream in the consumer. `cmd/ingest` runs both halves,
+with graceful shutdown and a 500ms drain ticker. ADR-0012 supersedes parts of
+ADR-0004 and ADR-0005. 207 tests.
+
+**Key decision:** Availability decided it. Ingest needs only the log, so usage
+keeps being accepted while Postgres is down and the consumer catches up
+afterwards — there's a test that posts ten events with nothing consuming, then
+drains and finds all ten. The alternative (a synchronous dedup lookup at ingest)
+keeps the nicer API but fails every one of those requests, losing the usage at
+the client. What it costs: key reuse is now invisible to the caller.
+
+**Couldn't have written myself yet:** That `received_at` had to move, and why
+that's an improvement rather than a compromise. ADR-0001 defines it as "when we
+took durable custody"; that used to be the Postgres insert and is now the log
+append — earlier, closer to when the client actually sent it, so lateness
+measurements get *more* accurate. Also that the handler now depends on the log
+being opened with `SyncGroup`: a `202` on the strength of an append is only
+honest if the append is genuinely durable, and nothing in the type system
+enforces that.

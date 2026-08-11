@@ -1,10 +1,17 @@
 # ADR-0005: Detecting a reused idempotency key
 
-- **Status:** Accepted
+- **Status:** Accepted, superseded in part by [ADR-0012](0012-ingest-appends-to-the-log.md)
 - **Date:** 2026-08-03
 - **Deciders:** Rasheed
 - **Related:** [ADR-0002](0002-dedup-enforcement.md), [ADR-0004](0004-ingest-api-contract.md)
 - **Resolves:** PLAN.md debt item D6
+
+> **Amendment (2026-08-11):** the fingerprint and everything below about how it
+> is computed still stand — it is now computed at ingest and carried on the log
+> record. What changed is the response: ingest cannot see the events table, so
+> reuse is no longer reported as `409 idempotency_key_reuse`. The consumer
+> detects it, drops the event, counts it, and logs it. That is weaker, and
+> D29 (a dead-letter table) is what would restore it. See ADR-0012.
 
 ## Context
 

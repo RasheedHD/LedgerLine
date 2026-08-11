@@ -144,8 +144,8 @@ Target shape at project completion:
 
 | Path | Responsibility | Status |
 |---|---|---|
-| `cmd/ingest/` | Process entry point, DB wiring, HTTP server | Skeleton exists |
-| `billing/ingest/` | HTTP handler, decode, validate | Done: validation, idempotency, fingerprinting |
+| `cmd/ingest/` | Process entry point, log + DB wiring, HTTP server, consumer loop | Done: graceful shutdown, DB-optional startup |
+| `billing/ingest/` | HTTP handler, decode, validate, append to log | Done: no database dependency |
 | `billing/dedup/` | Idempotency and deduplication | Enforced in `billing/ingest` + the DB constraint; no separate package |
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
@@ -585,7 +585,7 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D6~~ | ~~Same key + different payload silently discarded~~ — **closed 2026-08-03** by ADR-0005: SHA-256 fingerprint, `409 idempotency_key_reuse` on mismatch | ADR-0005 | 1 |
 | **D7** | Bounded, day-partitioned dedup table not built — **deferred to Phase 7, pending benchmark evidence.** As specified it is a cache in front of the constraint, and adding a lookup before the insert makes the *common* path (a new event) two round trips instead of one. It only pays off once the unique index no longer fits in memory, which is unmeasured. ADR-0002's own principle — "the constraint is the invariant, anything in front of it is a cache" — argues against building a cache with no demonstrated need | ADR-0001 §4 | 7 |
 | **D8** | Connection pool entirely at defaults — unbounded connections | ADR-0003 | 1 |
-| **D9** | No graceful shutdown; in-flight requests die on exit | code | 8 |
+| ~~D9~~ | ~~No graceful shutdown~~ — **closed 2026-08-11.** `srv.Shutdown` plus a final consumer drain before the log closes. An in-flight request cut off after appending would make the client retry an event that was in fact stored | ADR-0012 | 8 |
 | **D10** | Dev credentials hardcoded as a fallback DSN in `main.go` | code | 8 |
 | ~~D11~~ | ~~No clock-skew clamp on `occurred_at`~~ — **closed 2026-08-03.** 5-minute forward tolerance | ADR-0004 | 1 |
 | ~~D12~~ | ~~No meter registry~~ — **closed 2026-08-03.** Unregistered meters are refused by `Rate`; a meter with no price is refused too | ADR-0011 | 4 |
@@ -604,9 +604,9 @@ Append-only. Close items by marking them, not deleting them.
 | **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
 | **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
 | **D35** | Nothing turns priced line items into ledger transactions yet; rating and posting are not connected | ADR-0011 | 6 |
-| **D29** | Consumer conflicts and undecodable records are counted and logged but not stored anywhere actionable. A dead-letter table is what I3 really asks for | ADR-0009 | 3 |
-| **D30** | The consumer runs `Drain` to completion and returns; continuous tailing with backoff is not built | ADR-0009 | 3 |
-| **D31** | **OPEN DECISION.** Once ingest appends to the log it cannot read `events`, so it cannot return `duplicate: true` or `409 idempotency_key_reuse`. Either the ADR-0004/0005 contract is superseded, or ingest keeps a synchronous dedup lookup and gives up the availability the log was added for. Blocks the ingest rewire | ADR-0004, ADR-0005 | 3 |
+| **D29** | **Raised in priority by ADR-0012.** Consumer conflicts and undecodable records are counted and logged but not stored anywhere actionable — and now that ingest cannot report key reuse to the client, this log line is the ONLY signal that usage was dropped. A dead-letter table is what I3 really asks for | ADR-0009, ADR-0012 | 3 |
+| ~~D30~~ | ~~No continuous tailing~~ — **closed 2026-08-11.** `cmd/ingest` runs the consumer on a 500ms ticker with a final drain on shutdown. Backoff on repeated failure is still absent | ADR-0012 | 3 |
+| ~~D31~~ | ~~Ingest cannot answer duplicate/reuse once it appends to the log~~ — **closed 2026-08-11** by ADR-0012. Ingest appends and returns `202 {"offset": N}`; dedup stays downstream. Availability was the deciding factor. Cost: key reuse is invisible to the client, which raises the priority of D29 | ADR-0012 | 3 |
 | **D27** | `indexIntervalBytes` is a fixed 4 KiB, untuned. A log of tiny records scans ~500 per read; a log of large records indexes every one | ADR-0007 | 7 |
 | **D24** | The log grows without bound; no segment retention or deletion | ADR-0006 | 2 |
 | ~~D17~~ | ~~CLAUDE.md's orphaned three-directory list~~ — **closed 2026-08-03.** Relabelled as "the three components that matter most"; the write-them-myself constraint is retired along with the tutoring loop | CLAUDE.md | — |
@@ -628,6 +628,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0009](docs/adr/0009-delivery-semantics.md) | Delivery semantics and where the consumer offset lives | Accepted |
 | [0010](docs/adr/0010-double-entry-ledger.md) | The double-entry ledger | Accepted |
 | [0011](docs/adr/0011-pricing.md) | Pricing and the meter registry | Accepted |
+| [0012](docs/adr/0012-ingest-appends-to-the-log.md) | Ingest appends to the log; dedup stays downstream | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -676,28 +677,25 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phase 2 is complete.** Framing, segments, recovery, the sparse index, and a
-measured fsync dial are all done and tested (30 tests in `broker/log`).
+**Phase 3 is complete.** Ingest appends to the log, the consumer drains it into
+Postgres with exactly-once processing, and the whole seam is verified end to
+end against the running binary: three retries produce three log records and one
+database row.
 
-**Next: Phase 3, the seam.** Ingest stops writing to Postgres directly and
-appends to the log; a consumer drains the log into Postgres. This is where the
-thesis sentence stops being theoretical, and it has three parts that must be
-done in order:
+**Phases 1, 2, 3, 4 and 5 are done.** 207 tests, none skipped.
 
-1. ~~**Group commit (D26).**~~ **Done** — `SyncGroup` lands every
-   acknowledgement behind a completed fsync, at 7.2× `SyncAlways` under 64
-   concurrent writers. ADR-0008.
-2. ~~**The consumer and its offset.**~~ **Done** — the offset lives in Postgres
-   and advances in the same transaction as the inserts, making processing
-   exactly-once rather than at-least-once with cleanup. Replay from offset 0
-   returns every record as a duplicate and does not move the row count.
-   ADR-0009.
-3. **The ingest rewire — BLOCKED on D31.** Ingest appending to the log cannot
-   read `events`, so `duplicate: true` and `409 idempotency_key_reuse` become
-   unanswerable. Either ADR-0004/0005's contract is superseded, or ingest keeps
-   a synchronous dedup lookup and surrenders the availability the log exists to
-   provide. This is a decision, not a task.
-4. **`received_at` moves** (after D31). ADR-0001 defines it as "when we took
-   durable custody." That becomes the log append rather than the Postgres
-   insert — a semantic change to the field the entire late-event policy rests
-   on, so it needs an ADR amendment rather than a quiet edit.
+**Next, in rough order of value:**
+
+1. **D29 — the dead-letter table.** Now the highest-value correctness work.
+   Since ADR-0012, a client reusing an idempotency key gets a `202` while its
+   usage is dropped, and a log line is the only trace. That is I3's weakest
+   point in the system today.
+2. **D35 — connect pricing to the ledger.** Rating produces amounts, the ledger
+   stores them, and nothing joins the two. Needs a chart of accounts and a
+   posting rule. This is what turns two libraries into a billing system.
+3. **Phase 6 — periods and invoicing.** I4 (closed invoices are immutable) is
+   now the only invariant with no enforcement anywhere, because nothing closes.
+   Also where ADR-0001 §5's late-event roll-forward finally gets implemented,
+   and where D3 gets settled.
+4. **CI (D16, D19, D21).** Cheap, and the only way to get `go test -race` over
+   the group-commit code, since this machine's gcc is 32-bit only.

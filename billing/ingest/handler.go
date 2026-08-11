@@ -1,12 +1,19 @@
-// Package ingest accepts usage events over HTTP and writes them to Postgres.
+// Package ingest accepts usage events over HTTP and appends them to the broker
+// log.
 //
-// See ADR-0001 for the event schema, ADR-0002 for where deduplication is
-// enforced, and ADR-0004 for this endpoint's contract.
+// Ingest does not talk to Postgres. It validates, appends, and answers. Every
+// correctness concern beyond "is this request well formed" -- deduplication,
+// reuse detection, pricing, posting -- happens downstream in the consumer.
+//
+// That division is the point: ingest stays available and fast when the database
+// is slow or down, which is the reason for putting a log in front of it at all.
+// The cost is that ingest can no longer tell a client whether its event was a
+// duplicate, because it cannot see the events table. See ADR-0012.
+//
+// See ADR-0001 for the event schema and ADR-0004 for the rejection taxonomy.
 package ingest
 
 import (
-	"bytes"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -14,6 +21,7 @@ import (
 	"time"
 
 	"github.com/RasheedHD/LedgerLine/billing/event"
+	brokerlog "github.com/RasheedHD/LedgerLine/broker/log"
 )
 
 // A request body large enough for any legitimate single event and small enough
@@ -28,7 +36,7 @@ type eventRequest struct {
 	TenantID string `json:"tenant_id"`
 	Meter    string `json:"meter"`
 
-	// Quantity stays a string from the wire all the way to Postgres and is
+	// Quantity stays a string from the wire all the way to storage and is
 	// never parsed into a Go number. ADR-0001 section 3: converting to
 	// float64 here would reintroduce exactly the precision loss NUMERIC
 	// exists to prevent, and it would happen silently.
@@ -42,14 +50,17 @@ type eventRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
-// acceptedResponse is returned for both a new event and a duplicate.
+// acceptedResponse is returned once the event is durable in the log.
 //
-// The status code is 202 either way -- a retry gets the same answer as the
-// original -- while Duplicate tells a client that cares which one happened.
-// ADR-0004 explains why both properties are needed at once.
+// The offset is the event's position in the log, which is the only identifier
+// ingest can honestly hand out: the database row does not exist yet and may not
+// for another few milliseconds.
+//
+// There is deliberately no `duplicate` field. Ingest cannot know -- that answer
+// lives in the events table, which is downstream. ADR-0012 explains why that
+// was the right trade and what it costs.
 type acceptedResponse struct {
-	ID        int64 `json:"id"`
-	Duplicate bool  `json:"duplicate"`
+	Offset uint64 `json:"offset"`
 }
 
 type errorResponse struct {
@@ -61,39 +72,9 @@ type errorBody struct {
 	Detail string `json:"detail"`
 }
 
-// CRITICAL: this statement is where idempotency is enforced.
-//
-// Two things are load-bearing and neither is obvious.
-//
-// ON CONFLICT ... DO UPDATE rather than DO NOTHING. DO NOTHING returns zero
-// rows on conflict, so it cannot tell us the id of the row that already
-// exists, and recovering it with a follow-up SELECT has a race: under READ
-// COMMITTED the conflicting row may belong to a transaction that has not
-// committed yet, so the SELECT finds nothing. DO UPDATE blocks until that
-// transaction resolves and then returns the row. The SET is deliberately a
-// no-op -- assigning the column to itself -- because the update exists only to
-// make RETURNING fire.
-//
-// (xmax = 0) distinguishes an insert from a conflict. xmax is a Postgres system
-// column holding the id of the transaction that deleted or locked the row; a
-// freshly inserted tuple has no such transaction and so has xmax = 0, while the
-// tuple returned from the DO UPDATE path was locked and so does not. This is a
-// Postgres implementation detail rather than standard SQL, and it is the price
-// of learning insert-versus-conflict in a single round trip.
-// The returned payload_fingerprint is the STORED one, not the one just
-// offered: the DO UPDATE touches only tenant_id, so every other column in the
-// returned row still holds its original value. That is what makes reuse
-// detectable -- we get back what the key was first used for and can compare.
-const insertEvent = `
-INSERT INTO events (tenant_id, meter, quantity, occurred_at, received_at, idempotency_key, payload_fingerprint)
-VALUES ($1, $2, $3::numeric, $4, $5, $6, $7)
-ON CONFLICT (tenant_id, idempotency_key)
-DO UPDATE SET tenant_id = events.tenant_id
-RETURNING id, (xmax = 0) AS inserted, payload_fingerprint`
-
 // Handler serves POST /events.
 type Handler struct {
-	db *sql.DB
+	log *brokerlog.Log
 
 	// Injected so the clock-skew and backfill-window rules can be tested at
 	// fixed instants instead of relative to whenever the suite happens to run.
@@ -102,11 +83,15 @@ type Handler struct {
 
 // NewHandler returns the POST /events handler.
 //
-// The database handle is a parameter rather than a package-level global so
-// this can be tested against a throwaway database without touching process
-// state.
-func NewHandler(db *sql.DB) *Handler {
-	return &Handler{db: db, now: time.Now}
+// CRITICAL: the log passed here must use brokerlog.SyncGroup.
+//
+// This handler returns 202 on the strength of the append, so the append has to
+// be genuinely durable before it returns. Under SyncNever or SyncEveryN the
+// record may still be only in the page cache, and the 202 becomes a promise the
+// system cannot keep across a power failure -- invariant I3 broken by
+// construction. See ADR-0008.
+func NewHandler(l *brokerlog.Log) *Handler {
+	return &Handler{log: l, now: time.Now}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -121,62 +106,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// CRITICAL: the server stamps received_at, and does it here rather than in
-	// SQL. This is the ingest-time half of ADR-0001's two-clock design -- every
+	// CRITICAL: received_at is stamped here, immediately before the append that
+	// makes it durable.
+	//
+	// ADR-0001 defines it as "when we took durable custody". That moment used
+	// to be the Postgres insert and is now the log append -- the event is safe
+	// once it is in the log, whether or not the database has caught up. Every
 	// late-event decision downstream is arithmetic on received_at minus
-	// occurred_at, so if this value is wrong or client-supplied, that whole
-	// policy is built on sand.
+	// occurred_at, so this value is what the whole late-event policy rests on.
 	receivedAt := h.now().UTC()
 
-	// The fingerprint is defined in billing/event, next to the type it hashes,
-	// so ingest and the consumer cannot drift apart on what "the same payload"
-	// means.
-	offered := event.Fingerprint(&event.UsageEvent{
-		TenantID:   req.TenantID,
-		Meter:      req.Meter,
-		Quantity:   req.Quantity,
-		OccurredAt: req.OccurredAt,
-	})
+	e := &event.UsageEvent{
+		TenantID:       req.TenantID,
+		Meter:          req.Meter,
+		Quantity:       req.Quantity,
+		OccurredAt:     req.OccurredAt,
+		ReceivedAt:     receivedAt,
+		IdempotencyKey: req.IdempotencyKey,
+	}
 
-	var id int64
-	var inserted bool
-	var stored []byte
-	err := h.db.QueryRowContext(r.Context(), insertEvent,
-		req.TenantID,
-		req.Meter,
-		req.Quantity,
-		req.OccurredAt,
-		receivedAt,
-		req.IdempotencyKey,
-		offered,
-	).Scan(&id, &inserted, &stored)
+	// Computed at ingest rather than by the consumer so that the value stored
+	// is the one derived from what the client actually sent, before any
+	// downstream code has had a chance to reinterpret it.
+	e.Fingerprint = event.Fingerprint(e)
+
+	record, err := event.Encode(e)
 	if err != nil {
-		log.Printf("insert event: %v", err)
-		writeError(w, &rejection{
-			status: http.StatusInternalServerError,
-			code:   "internal_error",
-			detail: "could not store event",
-		})
+		log.Printf("encode event: %v", err)
+		writeError(w, internalError())
 		return
 	}
 
-	// CRITICAL: a conflicting key whose stored payload differs is a reused key,
-	// not a retry. Accepting it would discard genuinely different usage while
-	// telling the client it was stored -- undercharging silently, which nobody
-	// ever reports. ADR-0005.
-	//
-	// A NULL stored fingerprint means the row predates migration 000002, so
-	// there is nothing to compare against and we do not pretend otherwise.
-	if !inserted && stored != nil && !bytes.Equal(stored, offered) {
-		writeError(w, &rejection{
-			status: http.StatusConflict,
-			code:   codeKeyReuse,
-			detail: "idempotency_key was already used for an event with different content",
-		})
+	offset, err := h.log.Append(record)
+	if err != nil {
+		log.Printf("append event: %v", err)
+		writeError(w, internalError())
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, acceptedResponse{ID: id, Duplicate: !inserted})
+	writeJSON(w, http.StatusAccepted, acceptedResponse{Offset: offset})
 }
 
 func (h *Handler) decode(w http.ResponseWriter, r *http.Request) (*eventRequest, *rejection) {
@@ -209,6 +177,14 @@ func (h *Handler) decode(w http.ResponseWriter, r *http.Request) (*eventRequest,
 	return &req, nil
 }
 
+func internalError() *rejection {
+	return &rejection{
+		status: http.StatusInternalServerError,
+		code:   "internal_error",
+		detail: "could not accept event",
+	}
+}
+
 func writeError(w http.ResponseWriter, rej *rejection) {
 	writeJSON(w, rej.status, errorResponse{Error: errorBody{
 		Code:   rej.code,
@@ -220,8 +196,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 
-	// The error is ignored on purpose: the status line is already sent and any
-	// database work is already committed, so there is nothing useful left to
-	// say to a client whose connection died mid-response.
+	// The error is ignored on purpose: the status line is already sent and the
+	// record is already durable, so there is nothing useful left to say to a
+	// client whose connection died mid-response.
 	_ = json.NewEncoder(w).Encode(body)
 }

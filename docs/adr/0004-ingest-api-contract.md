@@ -1,10 +1,17 @@
 # ADR-0004: The POST /events contract
 
-- **Status:** Accepted
+- **Status:** Accepted, superseded in part by [ADR-0012](0012-ingest-appends-to-the-log.md)
 - **Date:** 2026-08-03
 - **Deciders:** Rasheed
 - **Related:** [ADR-0001](0001-event-schema.md), [ADR-0002](0002-dedup-enforcement.md)
 - **Resolves:** PLAN.md debt items D2, D4, D5, D11, D13
+
+> **Amendment (2026-08-11):** ingest now appends to the broker log and cannot
+> read the events table, so the `duplicate` flag described below no longer
+> exists — a success is `202 {"offset": N}`. The rejection taxonomy, the
+> validation rules, and the reasoning about why a duplicate is not a client
+> error all stand; they are decidable from the request alone, which is why they
+> survived. See ADR-0012.
 
 ## Context
 
