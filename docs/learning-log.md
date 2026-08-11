@@ -210,3 +210,23 @@ a meaningful question. Proved it by removing DEFERRABLE and watching every
 normal post fail. And that my overflow test was wrong, not the code: postings
 append as +a, -a, +b, -b, so the running total never exceeds the largest single
 transfer and overflow is structurally impossible there.
+
+## 2026-08-03 (cont.) — pricing
+
+**What we built:** `billing/pricing` — meter registry, flat/graduated/volume
+models, and a pure `Rate` function. Migration-free; it is all in-memory
+arithmetic. ADR-0011. 184 tests across the repo.
+
+**Key decision:** Aggregate usage per meter *before* pricing, not per event.
+With tiers the two give different answers — 1500 units arriving as fifteen
+events of 100 costs $10.50 aggregated but $15.00 priced individually, because
+every event lands in the first tier and never reaches the discount the customer
+is entitled to. It also confines rounding to once per meter.
+
+**Couldn't have written myself yet:** Why `Plan.Prices` is a slice and not a map.
+Go randomises map iteration order deliberately, so rating that walked a map
+would emit line items in a different order every run — and I5 asks for a
+byte-identical result. Also that my float-guard test was wrong before the code
+was: a byte search for "float64" failed on three *comments* explaining why float
+is avoided. Parsing the AST fixes it, because comments aren't in the tree unless
+you ask for them.

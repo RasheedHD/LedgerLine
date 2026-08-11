@@ -149,7 +149,7 @@ Target shape at project completion:
 | `billing/dedup/` | Idempotency and deduplication | Enforced in `billing/ingest` + the DB constraint; no separate package |
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
-| `billing/pricing/` | Meters, plans, rating | Empty |
+| `billing/pricing/` | Meters, plans, rating | Done: flat, graduated, volume; pure |
 | `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
 | `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
@@ -411,11 +411,14 @@ handling.
 
 **Exit criteria:**
 
-- [ ] Table-driven tests over tier boundaries — exactly at, one below, one
-      above; zero quantity; a quantity large enough to cross every tier
-- [ ] Rating the same input twice produces byte-identical output
-- [ ] An unknown meter produces a defined, tested outcome rather than silence
-- [ ] No `float64` anywhere in the package (grep it, and put that grep in CI)
+- [x] Table-driven tests over tier boundaries — exactly at, one below, one
+      above; zero quantity; a quantity large enough to cross every tier. Both
+      graduated and volume, plus a test that the two disagree across a boundary
+- [x] Rating the same input twice produces byte-identical output — 200 repeats
+      plus 50 shuffles of the input order
+- [x] An unknown meter produces a defined, tested outcome rather than silence
+- [x] No `float64` anywhere under `billing/` — enforced by an AST-walking test,
+      not a grep, so the comments explaining the rule don't trip it
 
 **Prepares you to answer:** *How do you price tiered usage? Why must rating be
 a pure function?*
@@ -585,7 +588,7 @@ Append-only. Close items by marking them, not deleting them.
 | **D9** | No graceful shutdown; in-flight requests die on exit | code | 8 |
 | **D10** | Dev credentials hardcoded as a fallback DSN in `main.go` | code | 8 |
 | ~~D11~~ | ~~No clock-skew clamp on `occurred_at`~~ — **closed 2026-08-03.** 5-minute forward tolerance | ADR-0004 | 1 |
-| **D12** | No meter registry — a typo'd meter name is a silent no-op | ADR-0001 | 4 |
+| ~~D12~~ | ~~No meter registry~~ — **closed 2026-08-03.** Unregistered meters are refused by `Rate`; a meter with no price is refused too | ADR-0011 | 4 |
 | ~~D13~~ | ~~35-day backfill bound enforced nowhere~~ — **closed 2026-08-03.** Enforced, with its own `422 event_too_old` | ADR-0004 | 1 |
 | **D14** | Whether to store the original response body for Stripe-style replay, or only the id | ADR-0002 | 1 |
 | **D15** | Whether dedup belongs before or after the log write — broker's job or billing's | ADR-0002 | 3 |
@@ -598,6 +601,9 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
 | ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
 | **D28** | `SyncEveryN` is still in the API and still unsafe behind an acknowledgement; nothing in the type system prevents that mistake. A `Durable() bool` on the policy, or splitting the enum, would | ADR-0008 | 8 |
+| **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
+| **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
+| **D35** | Nothing turns priced line items into ledger transactions yet; rating and posting are not connected | ADR-0011 | 6 |
 | **D29** | Consumer conflicts and undecodable records are counted and logged but not stored anywhere actionable. A dead-letter table is what I3 really asks for | ADR-0009 | 3 |
 | **D30** | The consumer runs `Drain` to completion and returns; continuous tailing with backoff is not built | ADR-0009 | 3 |
 | **D31** | **OPEN DECISION.** Once ingest appends to the log it cannot read `events`, so it cannot return `duplicate: true` or `409 idempotency_key_reuse`. Either the ADR-0004/0005 contract is superseded, or ingest keeps a synchronous dedup lookup and gives up the availability the log was added for. Blocks the ingest rewire | ADR-0004, ADR-0005 | 3 |
@@ -621,6 +627,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0008](docs/adr/0008-group-commit.md) | Group commit | Accepted |
 | [0009](docs/adr/0009-delivery-semantics.md) | Delivery semantics and where the consumer offset lives | Accepted |
 | [0010](docs/adr/0010-double-entry-ledger.md) | The double-entry ledger | Accepted |
+| [0011](docs/adr/0011-pricing.md) | Pricing and the meter registry | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
