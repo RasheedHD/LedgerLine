@@ -297,3 +297,26 @@ would share an account with the revenue for the api_calls meter, and two
 unrelated figures would silently accumulate in one place. Also that half-open
 periods `[start, end)` are what stop an event at exactly midnight belonging to
 both periods or neither — tested at one nanosecond either side of both bounds.
+
+## 2026-08-11 (cont.) — periods and invoices
+
+**What we built:** `billing/invoicing` — period state machine, invoices, and
+closing. Deleted `billing/posting`, whose `Post` would re-bill already-invoiced
+events once invoices existed. Migration 000006. ADR-0015. Closes D3, D39, D40.
+224 tests.
+
+**Key decision:** `events.invoice_id` with **no lower bound** on the gather
+query. Selecting `[start, end)` would leave an event that arrived after its own
+period closed unbilled forever, because nobody gathers that window again.
+Gathering everything still unbilled up to this period's end means the next run
+picks it up — so ADR-0001 §5's late-event roll-forward isn't a special case, it's
+just what the query already does.
+
+**Couldn't have written myself yet:** That `SELECT ... FOR UPDATE` was load-
+bearing rather than defensive. I assumed concurrent closes were already safe via
+the unique constraint on `invoices.period_id`. Removing the lock fails the
+concurrency test **3 runs out of 3** — both closes read `state='open'`, both
+gather the same events, and the failure lands somewhere downstream where it is
+much harder to reason about. Also learned to drop the `closing` state: it only
+earns its place when closing is long-running and observable half-done, and a
+state nobody can ever see is one that eventually gets handled wrong.

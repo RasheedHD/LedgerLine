@@ -1,4 +1,4 @@
-package posting
+package invoicing
 
 import "fmt"
 
@@ -11,7 +11,7 @@ import "fmt"
 //
 // Neither set can be known in advance: tenants and meters arrive over time. So
 // the names are derived deterministically and the accounts are created on
-// demand via ledger.EnsureAccount.
+// demand via ledger.EnsureAccountTx.
 //
 // The prefixes matter. Without them a tenant called "api_calls" would collide
 // with the revenue account for the api_calls meter, and two entirely unrelated
@@ -32,12 +32,14 @@ func RevenueAccount(meter string) string {
 	return revenuePrefix + meter
 }
 
-// TransactionKey is the ledger idempotency key for a tenant's posting run in a
+// TransactionKey is the ledger idempotency key for a tenant's billing run in a
 // period.
 //
 // Derived rather than random, so the same run repeated -- after a crash, a
-// retry, or an operator running it twice -- records the usage once. This is
-// invariant I2 at the ledger boundary.
+// retry, or an operator running it twice -- records the revenue once. A random
+// key would post the same revenue again on every run and the ledger would
+// balance perfectly while being wrong, which is the one failure double-entry
+// cannot catch: both sides of a duplicate entry are equally wrong.
 func TransactionKey(tenantID, periodLabel string) string {
 	return fmt.Sprintf("usage:%s:%s", tenantID, periodLabel)
 }

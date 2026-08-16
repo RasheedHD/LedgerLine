@@ -150,7 +150,7 @@ Target shape at project completion:
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
 | `billing/pricing/` | Meters, plans, rating | Done: flat, graduated, volume; pure |
-| `billing/posting/` | Chart of accounts, usage → ledger entries | Done: revenue recognition per tenant/meter |
+| `billing/invoicing/` | Periods, invoices, chart of accounts, revenue recognition | Done: I4 enforced, late roll-forward |
 | `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
 | `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
@@ -580,7 +580,7 @@ Append-only. Close items by marking them, not deleting them.
 |---|---|---|---|
 | ~~D1~~ | ~~Zero tests in the repo~~ — **closed 2026-08-03.** 31 tests against real Postgres; harness in `internal/testdb` | — | 1 |
 | ~~D2~~ | ~~ADR contradiction on duplicate distinguishability~~ — **closed 2026-08-03** by ADR-0004: status carries outcome class, body carries detail | ADR-0004 | 1 |
-| **D3** | ADR-0001 §5 says late events are "flagged"; §1's struct has no such field and the migration derives it | ADR-0001 | 6 |
+| ~~D3~~ | ~~ADR-0001 §5's late-event flag~~ — **closed 2026-08-11.** Lateness is derived at invoice time from the event's `occurred_at` against the period it is billed in, and surfaced as `LineItem.Late`. No column on `events` | ADR-0015 | 6 |
 | ~~D4~~ | ~~Duplicate key returns `500`~~ — **closed 2026-08-03.** Returns `202` with `duplicate: true` and the original id | ADR-0004 | 1 |
 | ~~D5~~ | ~~No validation at all~~ — **closed 2026-08-03.** Full validation before any database work | ADR-0004 | 1 |
 | ~~D6~~ | ~~Same key + different payload silently discarded~~ — **closed 2026-08-03** by ADR-0005: SHA-256 fingerprint, `409 idempotency_key_reuse` on mismatch | ADR-0005 | 1 |
@@ -605,8 +605,10 @@ Append-only. Close items by marking them, not deleting them.
 | **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
 | **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
 | ~~D35~~ | ~~Nothing connects priced line items to ledger transactions~~ — **closed 2026-08-11** by ADR-0014. `billing/posting` reads usage by period, prices it, and posts debit-receivable/credit-revenue. Verified end to end from HTTP to trial balance | ADR-0014 | 6 |
-| **D39** | **Sharpest open problem.** Nothing records which events a posting run included, so usage arriving for an already-posted period is never billed — silently. Phase 6's period state machine has to solve it | ADR-0014 | 6 |
-| **D40** | Two concurrent posting runs for the same tenant and period race; the loser gets `AlreadyPosted`, which is correct by accident of the unique constraint rather than by design | ADR-0014 | 6 |
+| ~~D39~~ | ~~Usage arriving for an already-posted period silently never billed~~ — **closed 2026-08-11** by ADR-0015. `events.invoice_id` makes "unbilled" queryable; the next period picks it up, which is also ADR-0001 §5's roll-forward | ADR-0015 | 6 |
+| ~~D40~~ | ~~Concurrent posting runs race~~ — **closed 2026-08-11.** `SELECT ... FOR UPDATE` on the period row. Mutation-tested: removing it fails the concurrency test 3 runs out of 3 | ADR-0015 | 6 |
+| **D41** | Nothing creates periods on a schedule or decides when one should close, so a tenant with no open period accumulates unbilled events indefinitely | ADR-0015 | 8 |
+| **D42** | Late usage is billed at the *next* period's prices. If prices changed in between, it is charged at the newer rate — needs plan versioning (D34) to fix properly | ADR-0015 | 6 |
 | ~~D29~~ | ~~Conflicts and undecodable records not stored anywhere actionable~~ — **closed 2026-08-11** by ADR-0013. `dead_letters` stores the raw record, reason, tenant and key, written in the batch transaction. `Stats.Accounted()` states I3 as an arithmetic identity | ADR-0013 | 3 |
 | **D36** | `dead_letters.resolved_at` exists and nothing writes it; there is no tooling to mark one resolved | ADR-0013 | 8 |
 | **D37** | No command to replay a dead letter by hand, though the raw bytes are stored so it is possible | ADR-0013 | 8 |
@@ -636,7 +638,8 @@ Append-only. Close items by marking them, not deleting them.
 | [0011](docs/adr/0011-pricing.md) | Pricing and the meter registry | Accepted |
 | [0012](docs/adr/0012-ingest-appends-to-the-log.md) | Ingest appends to the log; dedup stays downstream | Accepted |
 | [0013](docs/adr/0013-dead-letters.md) | Dead letters | Accepted |
-| [0014](docs/adr/0014-posting-usage-to-the-ledger.md) | Posting usage to the ledger | Accepted |
+| [0014](docs/adr/0014-posting-usage-to-the-ledger.md) | Posting usage to the ledger | Superseded by 0015 |
+| [0015](docs/adr/0015-periods-and-invoices.md) | Billing periods and invoices | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -685,24 +688,32 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-5 are done and the pipeline is whole.** 226 tests, none skipped.
-`TestFullPipelineFromHTTPToLedger` runs HTTP → log → consumer → events →
-pricing → ledger with nothing faked, and asserts 140 log records become a $1.00
-invoice with a zero trial balance.
+**Phases 1-6 are done. Every invariant I1-I6 now has enforcement somewhere.**
+224 tests, none skipped. Six migrations, round-tripping cleanly.
 
-**Next: Phase 6, periods and invoicing.** It is now clearly the right thing,
-for three reasons that have converged:
+| Invariant | Enforced by |
+|---|---|
+| I1 money conserved | Balanced-by-construction transfers + deferred DB trigger |
+| I2 no double billing | Unique constraint + derived ledger idempotency keys |
+| I3 nothing silently lost | `dead_letters` + `Stats.Accounted()` |
+| I4 closed invoices immutable | `BEFORE UPDATE OR DELETE` triggers |
+| I5 deterministic replay | Pure rating, sorted output, offset-in-transaction |
+| I6 no float | AST-walking test over all of `billing/` |
 
-1. **I4 is the only invariant with no enforcement anywhere**, because nothing
-   closes.
-2. **D39 is a live correctness bug.** Usage arriving for an already-posted
-   period is silently never billed. A period state machine is what fixes it —
-   posting has to know whether a period is still open.
-3. **ADR-0001 §5's late-event roll-forward** was designed in the very first
-   session and has never been implemented. D3 is still open for the same
-   reason.
+**Next: Phase 7, the chaos suite.** It is now the right thing and was not
+before: chaos asserts I1-I6 *together under injected faults*, and until this
+session several of them had nothing to assert. `chaos/` is still empty and it is
+the README's last unfulfilled clause — "a chaos suite that proves invoices stay
+correct to the cent".
 
-After that: **Phase 7, the chaos suite.** Every invariant it needs to assert now
-exists and is individually tested; chaos is where they get asserted together
-under injected faults. And **CI** (D16, D19, D21), which is the only way to run
-`go test -race` over the group-commit code.
+The faults worth injecting, roughly in order of what they would actually catch:
+
+1. Kill the consumer between processing and offset commit → I2
+2. Kill during a period close → I1, I4 (does a half-closed period exist?)
+3. Deliver every record twice → I2
+4. Drop the database mid-batch → I3
+5. Clock skew across ingest and close → I4
+
+After that: **CI** (D16, D19, D21), which is the only way to run `go test -race`
+over group commit, and **Phase 8** polish — the README still describes a project
+rather than this one.

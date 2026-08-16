@@ -3,6 +3,7 @@ package consumer_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +14,8 @@ import (
 
 	"github.com/RasheedHD/LedgerLine/billing/consumer"
 	"github.com/RasheedHD/LedgerLine/billing/ingest"
+	"github.com/RasheedHD/LedgerLine/billing/invoicing"
 	"github.com/RasheedHD/LedgerLine/billing/ledger"
-	"github.com/RasheedHD/LedgerLine/billing/posting"
 	"github.com/RasheedHD/LedgerLine/billing/pricing"
 	brokerlog "github.com/RasheedHD/LedgerLine/broker/log"
 	"github.com/RasheedHD/LedgerLine/internal/testdb"
@@ -246,17 +247,18 @@ func TestFullPipelineFromHTTPToLedger(t *testing.T) {
 	}}
 
 	ledgerStore := ledger.NewStore(db)
-	poster := posting.New(db, ledgerStore, registry)
+	billing := invoicing.New(db, ledgerStore, registry)
 
-	period := posting.Period{
-		Label: "2026-08",
-		Start: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
-		End:   time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+	period, err := billing.EnsurePeriod(ctx, "acme", "2026-08",
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("EnsurePeriod: %v", err)
 	}
 
-	result, err := poster.Post(ctx, "acme", period, plan)
+	result, err := billing.Close(ctx, period.ID, plan)
 	if err != nil {
-		t.Fatalf("Post: %v", err)
+		t.Fatalf("Close: %v", err)
 	}
 
 	// 100 calls at $0.01. The 40 retries must not appear anywhere in this
@@ -269,7 +271,7 @@ func TestFullPipelineFromHTTPToLedger(t *testing.T) {
 		t.Fatalf("invoice total = %s, want %s -- retries reached the ledger", result.Total, want)
 	}
 
-	receivable, err := ledgerStore.AccountByName(ctx, posting.ReceivableAccount("acme"))
+	receivable, err := ledgerStore.AccountByName(ctx, invoicing.ReceivableAccount("acme"))
 	if err != nil {
 		t.Fatalf("AccountByName: %v", err)
 	}
@@ -291,15 +293,15 @@ func TestFullPipelineFromHTTPToLedger(t *testing.T) {
 	}
 
 	// And running the billing job again changes nothing.
-	again, err := poster.Post(ctx, "acme", period, plan)
-	if err != nil {
-		t.Fatalf("second post: %v", err)
+	again, err := billing.Close(ctx, period.ID, plan)
+	if !errors.Is(err, invoicing.ErrPeriodClosed) {
+		t.Errorf("second close returned %v, want ErrPeriodClosed", err)
 	}
-	if !again.AlreadyPosted {
-		t.Error("the second posting run was not recognised as already posted")
+	if again.ID != result.ID {
+		t.Errorf("second close returned invoice %d, want the original %d", again.ID, result.ID)
 	}
 	if after, _ := ledgerStore.Balance(ctx, receivable.ID); after != want {
-		t.Errorf("receivable = %s after re-posting, want %s", after, want)
+		t.Errorf("receivable = %s after re-closing, want %s", after, want)
 	}
 }
 

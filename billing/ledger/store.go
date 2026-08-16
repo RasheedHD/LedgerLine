@@ -91,6 +91,22 @@ func (s *Store) CreateAccount(ctx context.Context, name string, kind AccountKind
 // the sign every report reads it with, and the existing postings would not
 // change to match.
 func (s *Store) EnsureAccount(ctx context.Context, name string, kind AccountKind) (AccountID, error) {
+	return ensureAccount(ctx, s.db, name, kind)
+}
+
+// EnsureAccountTx is EnsureAccount inside a caller's transaction, so a billing
+// run that creates accounts and posts to them is all-or-nothing.
+func (s *Store) EnsureAccountTx(ctx context.Context, tx *sql.Tx, name string, kind AccountKind) (AccountID, error) {
+	return ensureAccount(ctx, tx, name, kind)
+}
+
+// querier is the part of *sql.DB and *sql.Tx this package needs, so the same
+// code serves both without duplicating it.
+type querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func ensureAccount(ctx context.Context, q querier, name string, kind AccountKind) (AccountID, error) {
 	if name == "" {
 		return 0, errors.New("ledger: account name is required")
 	}
@@ -100,7 +116,7 @@ func (s *Store) EnsureAccount(ctx context.Context, name string, kind AccountKind
 
 	var id AccountID
 	var existingKind string
-	err := s.db.QueryRowContext(ctx, ensureAccountSQL, name, string(kind), time.Now().UTC()).
+	err := q.QueryRowContext(ctx, ensureAccountSQL, name, string(kind), time.Now().UTC()).
 		Scan(&id, &existingKind)
 	if err != nil {
 		return 0, fmt.Errorf("ensure account %q: %w", name, err)
@@ -136,7 +152,41 @@ func (s *Store) AccountByName(ctx context.Context, name string) (Account, error)
 // stores it once and reports the second attempt as already posted. That is
 // invariant I2 at the ledger boundary.
 func (s *Store) Post(ctx context.Context, t *Transaction) (id int64, alreadyPosted bool, err error) {
-	// Re-checked here rather than trusted from construction. Post is the last
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("begin: %w", err)
+	}
+	// A no-op after a successful commit, so it is safe unconditionally and
+	// removes any chance of an early return leaking an open transaction.
+	defer tx.Rollback()
+
+	id, alreadyPosted, err = s.PostTx(ctx, tx, t)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// CRITICAL: the deferred balance trigger fires here, not at the inserts
+	// inside PostTx. If the postings do not sum to zero, this is where it is
+	// caught -- so a failure from Commit is not necessarily an infrastructure
+	// problem, it may be the database refusing to let the books go out of
+	// balance.
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("commit transaction: %w", err)
+	}
+	return id, alreadyPosted, nil
+}
+
+// PostTx records a transaction inside a caller's transaction.
+//
+// Exists so that posting to the ledger can be atomic with whatever else the
+// caller is doing -- issuing an invoice and marking the events it billed, for
+// instance. Splitting those across two transactions would leave a window where
+// an invoice exists with no ledger entry behind it, or the reverse.
+//
+// The caller owns the commit, and therefore owns the moment the deferred
+// balance trigger fires.
+func (s *Store) PostTx(ctx context.Context, tx *sql.Tx, t *Transaction) (id int64, alreadyPosted bool, err error) {
+	// Re-checked here rather than trusted from construction. This is the last
 	// point before the numbers become permanent, and a Transaction could in
 	// principle have reached this call from a future code path that did not go
 	// through NewTransaction.
@@ -148,14 +198,6 @@ func (s *Store) Post(ctx context.Context, t *Transaction) (id int64, alreadyPost
 		return 0, false, fmt.Errorf("%w: postings sum to %s", ErrUnbalanced, total)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("begin: %w", err)
-	}
-	// A no-op after a successful commit, so it is safe unconditionally and
-	// removes any chance of an early return leaking an open transaction.
-	defer tx.Rollback()
-
 	err = tx.QueryRowContext(ctx, insertTransaction,
 		t.IdempotencyKey, t.OccurredAt, t.Description, time.Now().UTC()).Scan(&id)
 
@@ -165,9 +207,6 @@ func (s *Store) Post(ctx context.Context, t *Transaction) (id int64, alreadyPost
 		// postings would double every amount in it.
 		if err := tx.QueryRowContext(ctx, selectTransactionByKey, t.IdempotencyKey).Scan(&id); err != nil {
 			return 0, false, fmt.Errorf("look up existing transaction: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return 0, false, fmt.Errorf("commit: %w", err)
 		}
 		return id, true, nil
 	}
@@ -179,14 +218,6 @@ func (s *Store) Post(ctx context.Context, t *Transaction) (id int64, alreadyPost
 		if _, err := tx.ExecContext(ctx, insertPosting, id, int64(p.Account), int64(p.Amount)); err != nil {
 			return 0, false, fmt.Errorf("insert posting %d: %w", i, err)
 		}
-	}
-
-	// CRITICAL: the deferred balance trigger fires here, not at the inserts
-	// above. If the postings do not sum to zero, this is where it is caught --
-	// so a failure from Commit is not necessarily an infrastructure problem, it
-	// may be the database refusing to let the books go out of balance.
-	if err := tx.Commit(); err != nil {
-		return 0, false, fmt.Errorf("commit transaction: %w", err)
 	}
 	return id, false, nil
 }
