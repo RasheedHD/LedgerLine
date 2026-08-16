@@ -81,7 +81,7 @@ to assert exactly these under fault injection.**
 |---|---|---|
 | **I1** | **Money is conserved.** Every ledger transaction balances: `sum(debits) == sum(credits)`. | This is what double-entry buys. A violation means money was invented or destroyed. |
 | **I2** | **No usage is billed twice.** One idempotency key per tenant produces at most one billable event, regardless of how many times it is delivered. | The core promise. At-least-once delivery makes duplicates *certain*, not hypothetical. |
-| **I3** | **No accepted usage is silently lost.** Anything that received a `202` either reaches the ledger or lands in a dead-letter with a recorded reason. | Undercounting is worse than overcounting: the customer never complains, so you never find out. |
+| **I3** | **No accepted usage is silently lost.** Anything that received a `202` either reaches the ledger or lands in a dead-letter with a recorded reason. | Undercounting is worse than overcounting: the customer never complains, so you never find out. **Checkable:** `Stats.Accounted()` asserts `Inserted + Duplicates + Conflicts == Read`. |
 | **I4** | **Closed invoices are immutable.** Once a period closes, its invoice never changes. | Everything downstream — rev rec, tax, the customer's own books — acted on that number already. |
 | **I5** | **Replay is deterministic.** Reprocessing the log from offset 0 against an empty database produces a byte-identical ledger. | This is what makes the system debuggable and auditable. It also makes I1–I4 testable by construction. |
 | **I6** | **No float touches money or quantity.** Decimal from wire to storage to arithmetic. | Binary floating point cannot represent decimal fractions; error accumulates until the ledger fails to balance by cents nobody can explain. |
@@ -604,7 +604,10 @@ Append-only. Close items by marking them, not deleting them.
 | **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
 | **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
 | **D35** | Nothing turns priced line items into ledger transactions yet; rating and posting are not connected | ADR-0011 | 6 |
-| **D29** | **Raised in priority by ADR-0012.** Consumer conflicts and undecodable records are counted and logged but not stored anywhere actionable — and now that ingest cannot report key reuse to the client, this log line is the ONLY signal that usage was dropped. A dead-letter table is what I3 really asks for | ADR-0009, ADR-0012 | 3 |
+| ~~D29~~ | ~~Conflicts and undecodable records not stored anywhere actionable~~ — **closed 2026-08-11** by ADR-0013. `dead_letters` stores the raw record, reason, tenant and key, written in the batch transaction. `Stats.Accounted()` states I3 as an arithmetic identity | ADR-0013 | 3 |
+| **D36** | `dead_letters.resolved_at` exists and nothing writes it; there is no tooling to mark one resolved | ADR-0013 | 8 |
+| **D37** | No command to replay a dead letter by hand, though the raw bytes are stored so it is possible | ADR-0013 | 8 |
+| **D38** | Whether an error is permanent (dead-letter) or transient (retry the batch) is decided by which code path it arrives on rather than by inspecting it. Workable, not principled | ADR-0013 | 7 |
 | ~~D30~~ | ~~No continuous tailing~~ — **closed 2026-08-11.** `cmd/ingest` runs the consumer on a 500ms ticker with a final drain on shutdown. Backoff on repeated failure is still absent | ADR-0012 | 3 |
 | ~~D31~~ | ~~Ingest cannot answer duplicate/reuse once it appends to the log~~ — **closed 2026-08-11** by ADR-0012. Ingest appends and returns `202 {"offset": N}`; dedup stays downstream. Availability was the deciding factor. Cost: key reuse is invisible to the client, which raises the priority of D29 | ADR-0012 | 3 |
 | **D27** | `indexIntervalBytes` is a fixed 4 KiB, untuned. A log of tiny records scans ~500 per read; a log of large records indexes every one | ADR-0007 | 7 |
@@ -629,6 +632,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0010](docs/adr/0010-double-entry-ledger.md) | The double-entry ledger | Accepted |
 | [0011](docs/adr/0011-pricing.md) | Pricing and the meter registry | Accepted |
 | [0012](docs/adr/0012-ingest-appends-to-the-log.md) | Ingest appends to the log; dedup stays downstream | Accepted |
+| [0013](docs/adr/0013-dead-letters.md) | Dead letters | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -677,25 +681,21 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phase 3 is complete.** Ingest appends to the log, the consumer drains it into
-Postgres with exactly-once processing, and the whole seam is verified end to
-end against the running binary: three retries produce three log records and one
-database row.
-
-**Phases 1, 2, 3, 4 and 5 are done.** 207 tests, none skipped.
+**Phases 1-5 are done, and I3 now has real enforcement.** 213 tests, none
+skipped. Five migrations, round-tripping cleanly.
 
 **Next, in rough order of value:**
 
-1. **D29 — the dead-letter table.** Now the highest-value correctness work.
-   Since ADR-0012, a client reusing an idempotency key gets a `202` while its
-   usage is dropped, and a log line is the only trace. That is I3's weakest
-   point in the system today.
-2. **D35 — connect pricing to the ledger.** Rating produces amounts, the ledger
+1. **D35 — connect pricing to the ledger.** Rating produces amounts, the ledger
    stores them, and nothing joins the two. Needs a chart of accounts and a
-   posting rule. This is what turns two libraries into a billing system.
-3. **Phase 6 — periods and invoicing.** I4 (closed invoices are immutable) is
-   now the only invariant with no enforcement anywhere, because nothing closes.
-   Also where ADR-0001 §5's late-event roll-forward finally gets implemented,
-   and where D3 gets settled.
-4. **CI (D16, D19, D21).** Cheap, and the only way to get `go test -race` over
+   posting rule. This is what turns two good libraries into a billing system,
+   and it is the last structural gap before invoicing is possible.
+2. **Phase 6 — periods and invoicing.** I4 (closed invoices are immutable) is
+   the only invariant with no enforcement anywhere, because nothing closes.
+   Also where ADR-0001 §5's late-event roll-forward is finally implemented and
+   D3 gets settled.
+3. **Phase 7 — the chaos suite.** The README's last clause. Everything it needs
+   to assert (I1-I6) now exists and is individually tested; chaos is where they
+   get asserted together under injected faults.
+4. **CI (D16, D19, D21).** Cheap, and the only way to run `go test -race` over
    the group-commit code, since this machine's gcc is 32-bit only.

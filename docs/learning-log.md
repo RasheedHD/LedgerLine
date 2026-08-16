@@ -254,3 +254,26 @@ measurements get *more* accurate. Also that the handler now depends on the log
 being opened with `SyncGroup`: a `202` on the strength of an append is only
 honest if the append is genuinely durable, and nothing in the type system
 enforces that.
+
+## 2026-08-11 (cont.) — dead letters
+
+**What we built:** `dead_letters` (migration 000005) and the consumer writing to
+it. A record it cannot apply — reused key, undecodable bytes — is now stored
+with the raw log record, reason, tenant and key, in the same transaction that
+advances past it. Closes D29. ADR-0013. 213 tests.
+
+**Key decision:** Store the raw record verbatim. Without it a dead letter says
+"something failed at offset 412", which nobody can act on; with it the event can
+be inspected, explained to the customer, and replayed once the cause is fixed.
+That is the difference between I3 being satisfied and merely claimed. Also added
+`Stats.Accounted()`, which states I3 as arithmetic: inserted + duplicates +
+conflicts must equal read.
+
+**Couldn't have written myself yet:** Why the test I wrote to protect this
+passed while the feature was broken. `Drain` accumulates batch stats field by
+field and I never added the new `DeadLettered` field, so it was always 0 — and
+`TestReplayDoesNotDuplicateDeadLetters` asserts it *is* 0 after a replay, so it
+passed happily on a value that was never computed. **An assertion that something
+is zero proves nothing unless another test proves it can be non-zero.** Fixed by
+making the accumulation a `Stats.add` method so a new field is added in one
+place, not at every call site.

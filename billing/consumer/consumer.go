@@ -50,6 +50,22 @@ DO UPDATE SET next_offset = EXCLUDED.next_offset, updated_at = EXCLUDED.updated_
 
 const readOffset = `SELECT next_offset FROM consumer_offsets WHERE consumer = $1`
 
+// insertDeadLetter records a record the consumer accepted but could not apply.
+//
+// ON CONFLICT DO NOTHING because a replay re-encounters every failed record.
+// Without it each rebuild would append another copy and invariant I5 -- replay
+// produces the same state -- would not hold.
+const insertDeadLetter = `
+INSERT INTO dead_letters (consumer, log_offset, reason, detail, tenant_id, idempotency_key, record, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (consumer, log_offset) DO NOTHING`
+
+// Reasons a record ends up in the dead-letter table.
+const (
+	ReasonUndecodable = "undecodable_record"
+	ReasonKeyReuse    = "idempotency_key_reuse"
+)
+
 // Consumer reads a log into the events table.
 type Consumer struct {
 	name string
@@ -81,10 +97,40 @@ type Stats struct {
 	// the expected result of a replay, and proof that reprocessing is safe.
 	Duplicates int
 
-	// Conflicts is how many carried a key already used for DIFFERENT content.
-	// These are not stored. Non-zero means a client reused an idempotency key,
-	// and the usage in those events has been dropped.
+	// Conflicts is how many carried a key already used for DIFFERENT content,
+	// or could not be decoded at all. These do not become events; they are
+	// written to the dead-letter table instead. Non-zero means usage was
+	// dropped and a human needs to look.
 	Conflicts int
+
+	// DeadLettered is how many rows were written to dead_letters. Normally
+	// equal to Conflicts; lower on a replay, where the rows already exist and
+	// the insert is a no-op.
+	DeadLettered int
+}
+
+// add accumulates one batch's stats into a running total.
+//
+// A method rather than four additions at the call site, because the field-by-
+// field version is exactly the shape that silently drops a field when a new one
+// is added -- which is what happened to DeadLettered, and the test that should
+// have caught it passed instead because it asserted the count was zero.
+func (s *Stats) add(batch Stats) {
+	s.Read += batch.Read
+	s.Inserted += batch.Inserted
+	s.Duplicates += batch.Duplicates
+	s.Conflicts += batch.Conflicts
+	s.DeadLettered += batch.DeadLettered
+}
+
+// Accounted reports whether every record read was either stored, recognised as
+// a duplicate, or dead-lettered.
+//
+// This is invariant I3 as an arithmetic identity. If it is ever false, a record
+// came off the log and vanished without any of the three outcomes being
+// recorded -- which is precisely the silent loss I3 forbids.
+func (s Stats) Accounted() bool {
+	return s.Inserted+s.Duplicates+s.Conflicts == s.Read
 }
 
 // New returns a consumer identified by name.
@@ -140,10 +186,7 @@ func (c *Consumer) Drain(ctx context.Context) (Stats, error) {
 		}
 
 		stats, err := c.processBatch(ctx, next, batchEnd)
-		total.Read += stats.Read
-		total.Inserted += stats.Inserted
-		total.Duplicates += stats.Duplicates
-		total.Conflicts += stats.Conflicts
+		total.add(stats)
 		if err != nil {
 			return total, err
 		}
@@ -169,16 +212,25 @@ func (c *Consumer) processBatch(ctx context.Context, from, to uint64) (Stats, er
 			return stats, fmt.Errorf("read offset %d: %w", offset, err)
 		}
 
+		stats.Read++
+
 		e, err := event.Decode(record)
 		if err != nil {
 			// A record that cannot be decoded will never decode. Failing here
-			// would wedge the consumer on it forever, so it is counted,
-			// reported, and stepped over. Invariant I3 says nothing may be
-			// lost SILENTLY -- this is loud.
-			c.opts.Logger.Error("undecodable record skipped",
+			// would wedge the consumer on it forever, so it is dead-lettered
+			// and stepped over. The raw bytes go with it, since "offset 412
+			// failed" is not something anyone can act on.
+			c.opts.Logger.Error("undecodable record dead-lettered",
 				"offset", offset, "error", err)
-			stats.Read++
+
+			written, dlErr := c.deadLetter(ctx, tx, offset, ReasonUndecodable, err.Error(), nil, record)
+			if dlErr != nil {
+				return stats, fmt.Errorf("dead-letter offset %d: %w", offset, dlErr)
+			}
 			stats.Conflicts++
+			if written {
+				stats.DeadLettered++
+			}
 			continue
 		}
 
@@ -187,18 +239,26 @@ func (c *Consumer) processBatch(ctx context.Context, from, to uint64) (Stats, er
 			return stats, fmt.Errorf("apply offset %d: %w", offset, err)
 		}
 
-		stats.Read++
 		switch applied {
 		case appliedInserted:
 			stats.Inserted++
 		case appliedDuplicate:
 			stats.Duplicates++
 		case appliedConflict:
-			stats.Conflicts++
-			c.opts.Logger.Warn("idempotency key reused with different content; event dropped",
+			c.opts.Logger.Warn("idempotency key reused with different content; event dead-lettered",
 				"offset", offset,
 				"tenant_id", e.TenantID,
 				"idempotency_key", e.IdempotencyKey)
+
+			written, dlErr := c.deadLetter(ctx, tx, offset, ReasonKeyReuse,
+				"idempotency key already used for an event with different content", e, record)
+			if dlErr != nil {
+				return stats, fmt.Errorf("dead-letter offset %d: %w", offset, dlErr)
+			}
+			stats.Conflicts++
+			if written {
+				stats.DeadLettered++
+			}
 		}
 	}
 
@@ -218,6 +278,96 @@ func (c *Consumer) processBatch(ctx context.Context, from, to uint64) (Stats, er
 		return stats, fmt.Errorf("commit batch: %w", err)
 	}
 	return stats, nil
+}
+
+// deadLetter records a record that could not be applied, returning whether a
+// new row was written.
+//
+// CRITICAL: this runs inside the batch's transaction, alongside the offset
+// advance.
+//
+// If the dead letter were written separately, a crash between the two would
+// either advance past a record with nothing recording that it failed -- silent
+// loss, exactly what I3 forbids -- or record a failure for a record that was
+// never actually skipped. Sharing the transaction removes both windows, for the
+// same reason the offset itself lives in this database (ADR-0009).
+func (c *Consumer) deadLetter(
+	ctx context.Context,
+	tx *sql.Tx,
+	offset uint64,
+	reason, detail string,
+	e *event.UsageEvent,
+	record []byte,
+) (bool, error) {
+	// Nil for an undecodable record, which by definition has no readable
+	// tenant or key. sql.NullString rather than "" so the column is genuinely
+	// NULL and the partial index skips it.
+	var tenantID, idempotencyKey sql.NullString
+	if e != nil {
+		tenantID = sql.NullString{String: e.TenantID, Valid: true}
+		idempotencyKey = sql.NullString{String: e.IdempotencyKey, Valid: true}
+	}
+
+	result, err := tx.ExecContext(ctx, insertDeadLetter,
+		c.name, int64(offset), reason, detail, tenantID, idempotencyKey, record, time.Now().UTC())
+	if err != nil {
+		return false, err
+	}
+
+	// Zero rows means the conflict clause fired: this offset is already
+	// recorded, which is the expected outcome on a replay.
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// DeadLetter is one unapplied record, as stored.
+type DeadLetter struct {
+	Offset         uint64
+	Reason         string
+	Detail         string
+	TenantID       string
+	IdempotencyKey string
+	Record         []byte
+	CreatedAt      time.Time
+}
+
+const selectUnresolvedDeadLetters = `
+SELECT log_offset, reason, detail, COALESCE(tenant_id, ''), COALESCE(idempotency_key, ''), record, created_at
+FROM dead_letters
+WHERE consumer = $1 AND resolved_at IS NULL
+ORDER BY log_offset
+LIMIT $2`
+
+// UnresolvedDeadLetters returns records this consumer could not apply and
+// nobody has dealt with yet.
+//
+// The point of the dead-letter table is that this question has an answer. A
+// non-empty result means usage was accepted, acknowledged to a client, and then
+// dropped.
+func (c *Consumer) UnresolvedDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	rows, err := c.db.QueryContext(ctx, selectUnresolvedDeadLetters, c.name, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read dead letters: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DeadLetter
+	for rows.Next() {
+		var d DeadLetter
+		var offset int64
+		if err := rows.Scan(&offset, &d.Reason, &d.Detail, &d.TenantID, &d.IdempotencyKey, &d.Record, &d.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan dead letter: %w", err)
+		}
+		d.Offset = uint64(offset)
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dead letters: %w", err)
+	}
+	return out, nil
 }
 
 type applyResult int
