@@ -150,6 +150,7 @@ Target shape at project completion:
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
 | `billing/pricing/` | Meters, plans, rating | Done: flat, graduated, volume; pure |
+| `billing/posting/` | Chart of accounts, usage → ledger entries | Done: revenue recognition per tenant/meter |
 | `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
 | `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
@@ -603,7 +604,9 @@ Append-only. Close items by marking them, not deleting them.
 | **D28** | `SyncEveryN` is still in the API and still unsafe behind an acknowledgement; nothing in the type system prevents that mistake. A `Durable() bool` on the policy, or splitting the enum, would | ADR-0008 | 8 |
 | **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
 | **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
-| **D35** | Nothing turns priced line items into ledger transactions yet; rating and posting are not connected | ADR-0011 | 6 |
+| ~~D35~~ | ~~Nothing connects priced line items to ledger transactions~~ — **closed 2026-08-11** by ADR-0014. `billing/posting` reads usage by period, prices it, and posts debit-receivable/credit-revenue. Verified end to end from HTTP to trial balance | ADR-0014 | 6 |
+| **D39** | **Sharpest open problem.** Nothing records which events a posting run included, so usage arriving for an already-posted period is never billed — silently. Phase 6's period state machine has to solve it | ADR-0014 | 6 |
+| **D40** | Two concurrent posting runs for the same tenant and period race; the loser gets `AlreadyPosted`, which is correct by accident of the unique constraint rather than by design | ADR-0014 | 6 |
 | ~~D29~~ | ~~Conflicts and undecodable records not stored anywhere actionable~~ — **closed 2026-08-11** by ADR-0013. `dead_letters` stores the raw record, reason, tenant and key, written in the batch transaction. `Stats.Accounted()` states I3 as an arithmetic identity | ADR-0013 | 3 |
 | **D36** | `dead_letters.resolved_at` exists and nothing writes it; there is no tooling to mark one resolved | ADR-0013 | 8 |
 | **D37** | No command to replay a dead letter by hand, though the raw bytes are stored so it is possible | ADR-0013 | 8 |
@@ -633,6 +636,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0011](docs/adr/0011-pricing.md) | Pricing and the meter registry | Accepted |
 | [0012](docs/adr/0012-ingest-appends-to-the-log.md) | Ingest appends to the log; dedup stays downstream | Accepted |
 | [0013](docs/adr/0013-dead-letters.md) | Dead letters | Accepted |
+| [0014](docs/adr/0014-posting-usage-to-the-ledger.md) | Posting usage to the ledger | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -681,21 +685,24 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-5 are done, and I3 now has real enforcement.** 213 tests, none
-skipped. Five migrations, round-tripping cleanly.
+**Phases 1-5 are done and the pipeline is whole.** 226 tests, none skipped.
+`TestFullPipelineFromHTTPToLedger` runs HTTP → log → consumer → events →
+pricing → ledger with nothing faked, and asserts 140 log records become a $1.00
+invoice with a zero trial balance.
 
-**Next, in rough order of value:**
+**Next: Phase 6, periods and invoicing.** It is now clearly the right thing,
+for three reasons that have converged:
 
-1. **D35 — connect pricing to the ledger.** Rating produces amounts, the ledger
-   stores them, and nothing joins the two. Needs a chart of accounts and a
-   posting rule. This is what turns two good libraries into a billing system,
-   and it is the last structural gap before invoicing is possible.
-2. **Phase 6 — periods and invoicing.** I4 (closed invoices are immutable) is
-   the only invariant with no enforcement anywhere, because nothing closes.
-   Also where ADR-0001 §5's late-event roll-forward is finally implemented and
-   D3 gets settled.
-3. **Phase 7 — the chaos suite.** The README's last clause. Everything it needs
-   to assert (I1-I6) now exists and is individually tested; chaos is where they
-   get asserted together under injected faults.
-4. **CI (D16, D19, D21).** Cheap, and the only way to run `go test -race` over
-   the group-commit code, since this machine's gcc is 32-bit only.
+1. **I4 is the only invariant with no enforcement anywhere**, because nothing
+   closes.
+2. **D39 is a live correctness bug.** Usage arriving for an already-posted
+   period is silently never billed. A period state machine is what fixes it —
+   posting has to know whether a period is still open.
+3. **ADR-0001 §5's late-event roll-forward** was designed in the very first
+   session and has never been implemented. D3 is still open for the same
+   reason.
+
+After that: **Phase 7, the chaos suite.** Every invariant it needs to assert now
+exists and is individually tested; chaos is where they get asserted together
+under injected faults. And **CI** (D16, D19, D21), which is the only way to run
+`go test -race` over the group-commit code.

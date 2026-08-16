@@ -9,9 +9,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RasheedHD/LedgerLine/billing/consumer"
 	"github.com/RasheedHD/LedgerLine/billing/ingest"
+	"github.com/RasheedHD/LedgerLine/billing/ledger"
+	"github.com/RasheedHD/LedgerLine/billing/posting"
+	"github.com/RasheedHD/LedgerLine/billing/pricing"
 	brokerlog "github.com/RasheedHD/LedgerLine/broker/log"
 	"github.com/RasheedHD/LedgerLine/internal/testdb"
 )
@@ -190,6 +194,112 @@ func TestRejectedRequestsNeverReachTheDatabase(t *testing.T) {
 	}
 	if n := countRows(t, db); n != 0 {
 		t.Errorf("row count = %d, want 0", n)
+	}
+}
+
+// THE WHOLE SYSTEM, end to end: HTTP request -> broker log -> consumer ->
+// events -> pricing -> double-entry ledger.
+//
+// Every component is real. This is the project's thesis reduced to one
+// assertion: a client that retries produces a log full of duplicates and a
+// ledger that charges exactly once, with the books balanced.
+func TestFullPipelineFromHTTPToLedger(t *testing.T) {
+	server, l, c, db := newPipeline(t)
+	ctx := context.Background()
+
+	// 100 billable calls, sent as 100 distinct events...
+	for i := 0; i < 100; i++ {
+		if status := postEvent(t, server, fmt.Sprintf("call-%03d", i), "1"); status != http.StatusAccepted {
+			t.Fatalf("event %d: status = %d, want 202", i, status)
+		}
+	}
+	// ...and 40 retries of events already sent, as a flaky client would.
+	for i := 0; i < 40; i++ {
+		postEvent(t, server, fmt.Sprintf("call-%03d", i), "1")
+	}
+
+	if l.NextOffset() != 140 {
+		t.Fatalf("log holds %d records, want 140", l.NextOffset())
+	}
+
+	stats, err := c.Drain(ctx)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if !stats.Accounted() {
+		t.Fatalf("records unaccounted for: %+v", stats)
+	}
+	if stats.Inserted != 100 || stats.Duplicates != 40 {
+		t.Fatalf("stats = %+v, want 100 inserted and 40 duplicates", stats)
+	}
+
+	registry, err := pricing.NewRegistry(pricing.Meter{Name: "api_calls", Unit: "call"})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	unitPrice, err := ledger.ParseAmount("0.01")
+	if err != nil {
+		t.Fatalf("ParseAmount: %v", err)
+	}
+	plan := pricing.Plan{Name: "standard", Prices: []pricing.Price{
+		{Meter: "api_calls", Model: pricing.Flat, UnitPrice: unitPrice},
+	}}
+
+	ledgerStore := ledger.NewStore(db)
+	poster := posting.New(db, ledgerStore, registry)
+
+	period := posting.Period{
+		Label: "2026-08",
+		Start: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	result, err := poster.Post(ctx, "acme", period, plan)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	// 100 calls at $0.01. The 40 retries must not appear anywhere in this
+	// number -- that is invariant I2 surviving the entire pipeline.
+	want, err := ledger.ParseAmount("1.00")
+	if err != nil {
+		t.Fatalf("ParseAmount: %v", err)
+	}
+	if result.Total != want {
+		t.Fatalf("invoice total = %s, want %s -- retries reached the ledger", result.Total, want)
+	}
+
+	receivable, err := ledgerStore.AccountByName(ctx, posting.ReceivableAccount("acme"))
+	if err != nil {
+		t.Fatalf("AccountByName: %v", err)
+	}
+	balance, err := ledgerStore.Balance(ctx, receivable.ID)
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if balance != want {
+		t.Errorf("receivable = %s, want %s", balance, want)
+	}
+
+	// INVARIANT I1, after the whole pipeline has run.
+	total, err := ledgerStore.TrialBalance(ctx)
+	if err != nil {
+		t.Fatalf("TrialBalance: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("trial balance = %s, want 0 -- money was created or destroyed", total)
+	}
+
+	// And running the billing job again changes nothing.
+	again, err := poster.Post(ctx, "acme", period, plan)
+	if err != nil {
+		t.Fatalf("second post: %v", err)
+	}
+	if !again.AlreadyPosted {
+		t.Error("the second posting run was not recognised as already posted")
+	}
+	if after, _ := ledgerStore.Balance(ctx, receivable.ID); after != want {
+		t.Errorf("receivable = %s after re-posting, want %s", after, want)
 	}
 }
 

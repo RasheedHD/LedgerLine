@@ -277,3 +277,23 @@ passed happily on a value that was never computed. **An assertion that something
 is zero proves nothing unless another test proves it can be non-zero.** Fixed by
 making the accumulation a `Stats.add` method so a new field is added in one
 place, not at every call site.
+
+## 2026-08-11 (cont.) — posting usage to the ledger
+
+**What we built:** `billing/posting` — the wire between pricing and the ledger.
+Reads a tenant's usage for a period, prices it, and posts one balanced
+transaction: debit `receivable:<tenant>`, credit `revenue:<meter>`. Closes D35.
+ADR-0014. 226 tests.
+
+**Key decision:** The ledger idempotency key is *derived* — `usage:<tenant>:<period>`
+— not generated. A random key would post the same revenue again on every run,
+and the ledger would balance perfectly while being wrong. That's the failure
+double-entry alone cannot catch, because both sides of a duplicate entry are
+equally wrong.
+
+**Couldn't have written myself yet:** That account names need namespace
+prefixes. Without `receivable:` and `revenue:`, a tenant called "api_calls"
+would share an account with the revenue for the api_calls meter, and two
+unrelated figures would silently accumulate in one place. Also that half-open
+periods `[start, end)` are what stop an event at exactly midnight belonging to
+both periods or neither — tested at one nanosecond either side of both bounds.

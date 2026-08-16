@@ -30,6 +30,19 @@ RETURNING id`
 	selectAccountByName = `
 SELECT id, name, kind FROM ledger_accounts WHERE name = $1`
 
+	// ensureAccount creates an account or returns the existing one's id.
+	//
+	// DO UPDATE with a no-op SET rather than DO NOTHING, for the same reason as
+	// the events insert: DO NOTHING returns no row on conflict, and recovering
+	// the id with a follow-up SELECT races -- under READ COMMITTED the
+	// conflicting row may belong to a transaction that has not committed yet.
+	// DO UPDATE blocks until it resolves and then returns the row.
+	ensureAccountSQL = `
+INSERT INTO ledger_accounts (name, kind, created_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (name) DO UPDATE SET name = ledger_accounts.name
+RETURNING id, kind`
+
 	insertTransaction = `
 INSERT INTO ledger_transactions (idempotency_key, occurred_at, description, created_at)
 VALUES ($1, $2, $3, $4)
@@ -63,6 +76,39 @@ func (s *Store) CreateAccount(ctx context.Context, name string, kind AccountKind
 	err := s.db.QueryRowContext(ctx, insertAccount, name, string(kind), time.Now().UTC()).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("create account %q: %w", name, err)
+	}
+	return id, nil
+}
+
+// EnsureAccount returns the id of an account, creating it if it does not exist.
+//
+// Needed because the chart of accounts grows on demand: a new tenant means a
+// new receivable account, and a new meter means a new revenue account, neither
+// of which can be known in advance.
+//
+// If the account already exists with a DIFFERENT kind, that is an error rather
+// than a silent adoption. An account changing from revenue to asset would flip
+// the sign every report reads it with, and the existing postings would not
+// change to match.
+func (s *Store) EnsureAccount(ctx context.Context, name string, kind AccountKind) (AccountID, error) {
+	if name == "" {
+		return 0, errors.New("ledger: account name is required")
+	}
+	if !kind.Valid() {
+		return 0, fmt.Errorf("ledger: %q is not an account kind", kind)
+	}
+
+	var id AccountID
+	var existingKind string
+	err := s.db.QueryRowContext(ctx, ensureAccountSQL, name, string(kind), time.Now().UTC()).
+		Scan(&id, &existingKind)
+	if err != nil {
+		return 0, fmt.Errorf("ensure account %q: %w", name, err)
+	}
+
+	if AccountKind(existingKind) != kind {
+		return 0, fmt.Errorf("ledger: account %q already exists as %q, refusing to treat it as %q",
+			name, existingKind, kind)
 	}
 	return id, nil
 }
