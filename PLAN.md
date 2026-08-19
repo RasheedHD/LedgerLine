@@ -597,7 +597,7 @@ Append-only. Close items by marking them, not deleting them.
 | **D18** | Every duplicate writes a dead tuple via the no-op `DO UPDATE`; autovacuum work scales with duplicate volume | ADR-0004 | 1 |
 | ~~D19~~ | ~~Integration tests skip silently~~ — **closed 2026-08-19.** `LEDGERLINE_REQUIRE_DB` makes an unreachable database fatal, plus a CI gate that fails on any skipped test. Verified both ways against a dead port | ADR-0017 | 8 |
 | **D20** | Docker Desktop leaves undeletable stale socket reparse points on unclean exit, blocking every subsequent start. Cleared by renaming `%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine` | env | — |
-| **D21** | **Addressed, NOT closed.** CI now runs `go test -race` on Linux, but it has never actually executed: the local gcc is 32-bit only and cannot build the race runtime. Group commit releases a lock around an fsync and coordinates waiters through a condition variable, which is exactly what a detector is built to find problems in. Closes when a run comes back green | ADR-0017 | 8 |
+| ~~D21~~ | ~~`go test -race` has never run~~ — **closed 2026-08-19.** First CI run was green: every package `ok` under `-race` on Linux, chaos included, no data race reported. Group commit passed the detector on its first exposure | ADR-0017 | 8 |
 | ~~D22~~ | ~~Dense in-memory position table~~ — **closed 2026-08-03.** Sparse on-disk index, 71 entries per 4000 records; open scales with segment count not record count | ADR-0007 | 2 |
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
 | ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
@@ -693,21 +693,21 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-7 are done and CI exists.** 231 tests, none skipped locally.
+**Phases 1-7 are done and CI is green.** 231 tests, none skipped, and
+`go test -race` passes on Linux — the first time the detector has ever run on
+this code. Group commit came through clean.
 
-**The immediate question is whether CI is green.** `go test -race` has never
-executed against this code, so the first workflow run is the first time the
-detector has ever seen group commit. It may fail, and that would be the pipeline
-earning its place on its first attempt. **D21 stays open until a run is green.**
+**What remains is making the project legible to someone else.** The system is
+built and proven; nobody arriving at the repository can tell.
 
-**After that, what remains is making the project legible to someone else:**
-
-1. **The README (D45).** It still describes an aspiration. It should describe
-   what exists: the architecture, the six invariants and where each is enforced,
-   how to run it, and the measured numbers from ADR-0007 and ADR-0008.
+1. **The README (D45).** Still two sentences describing an aspiration. It should
+   describe what exists: the architecture, the six invariants and where each is
+   enforced, how to run it, and the measured numbers from ADR-0007 and ADR-0008.
+   This is the highest-value remaining work by a distance — it is what a reader
+   sees first and currently it undersells the whole project.
 2. **`docs/interview-narrative.md`.** The five-minute walkthrough, the three
    hardest bugs, and what would be done differently. The learning log has the
-   raw material; nothing has assembled it.
+   raw material across seventeen entries; nothing has assembled it.
 3. **Smaller debt:** D10 (hardcoded dev DSN), D28 (`SyncEveryN` still reachable
    behind an acknowledgement), D36/D37 (dead-letter tooling), D44 (no fault the
    system should legitimately fail on), D46 (no benchmarks in CI).
