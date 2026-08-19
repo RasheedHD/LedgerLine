@@ -385,3 +385,25 @@ literal curl twice - and confirmed two 202s with offsets 0 and 1 and exactly one
 row in `events`. A README that lies about its own demo is worse than no README,
 because it is the first thing anyone tries and the first thing that loses their
 trust.
+
+## 2026-08-19 (cont.) - the interview narrative
+
+**What we built:** `docs/interview-narrative.md`, assembled from eighteen
+learning-log entries: the 60-second version, a five-minute walkthrough that
+follows the data, three bugs with the lesson each one generalises to, likely
+questions with answers grouped by topic, what I would do differently, and the
+numbers worth remembering. Closes the last substantial item.
+
+**Key decision:** Structure it around the three hardest *bugs* rather than the
+features. A feature list is what anyone can produce from the repository; the
+stories are what cannot be faked and what actually demonstrates understanding.
+Each one ends in a lesson that generalises past this project: an assertion that
+a value is zero proves nothing unless another test proves it can be non-zero; an
+unrealistic fault buries the real ones; a suite only ever run one way has only
+been tested one way.
+
+**Couldn't have written myself yet:** That "two things I was wrong about"
+belongs in the document as its own section. Being able to name where intuition
+failed - `kill -9` cannot tear a record, and the overflow test that was wrong
+rather than the code - is worth more in a conversation than another correct
+answer, because it is the part that cannot be memorised from a README.

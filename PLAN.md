@@ -608,6 +608,7 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D39~~ | ~~Usage arriving for an already-posted period silently never billed~~ — **closed 2026-08-11** by ADR-0015. `events.invoice_id` makes "unbilled" queryable; the next period picks it up, which is also ADR-0001 §5's roll-forward | ADR-0015 | 6 |
 | ~~D40~~ | ~~Concurrent posting runs race~~ — **closed 2026-08-11.** `SELECT ... FOR UPDATE` on the period row. Mutation-tested: removing it fails the concurrency test 3 runs out of 3 | ADR-0015 | 6 |
 | ~~D43~~ | ~~Chaos suite runtime~~ — **closed 2026-08-19.** `-short` skips the seven scenarios; CI does not pass `-short` | ADR-0017 | 8 |
+| ~~D47~~ | ~~No assembled interview narrative~~ — **closed 2026-08-19.** `docs/interview-narrative.md`: the 60-second version, the five-minute walkthrough, three bugs with their lessons, likely questions with answers, and the numbers | — | 8 |
 | ~~D45~~ | ~~README describes an aspiration, not the system~~ — **closed 2026-08-19.** Architecture, the six invariants and where each is enforced, measured numbers, a verified quickstart, and pointers into the ADRs | — | 8 |
 | **D46** | Nothing runs the benchmarks in CI, so a log performance regression would go unnoticed. Benchmarks are noisy on shared runners and an untrustworthy number is worse than none | ADR-0017 | 8 |
 | **D44** | Every injected fault is one the system is designed to survive. Nothing yet injects one it should legitimately fail on — disk full during a segment roll, a torn record from power loss | ADR-0016 | 8 |
@@ -694,26 +695,24 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-8 are essentially done.** 231 tests, CI green with the race detector,
-and the README now describes the system rather than an aspiration.
+**The project is complete against its stated goal.** Phases 1-8 done, 231 tests,
+CI green under `-race`, six migrations, seventeen ADRs, a README that describes
+the system, and an interview narrative assembled from eighteen sessions of
+learning-log entries.
 
-**The one substantial thing left is `docs/interview-narrative.md`** — the
-five-minute walkthrough, the three hardest bugs, and what would be done
-differently. Eighteen learning-log entries hold the raw material and nothing has
-assembled it. That is the last piece of the stated goal: being able to defend
-this in an interview months from now.
-
-**Then only small debt remains**, none of it load-bearing:
+**What remains is optional polish**, none of it load-bearing:
 
 - **D10** hardcoded dev DSN in `cmd/ingest`
 - **D28** `SyncEveryN` is still reachable behind an acknowledgement, with nothing
-  in the type system preventing it
+  in the type system preventing it — the one remaining footgun worth closing
 - **D36 / D37** no tooling to resolve or replay a dead letter
 - **D42** late usage is billed at the next period's prices; needs plan
-  versioning (D34) to fix properly
+  versioning (D34)
 - **D44** every injected fault is one the system is designed to survive
 - **D46** no benchmarks in CI
 
-**Stretch, if the project continues:** log replication would make the fsync
-tradeoff a real choice rather than a forced one, and would turn the single-node
-caveat in ADR-0007 into a design decision instead of a limitation.
+**If the project continues, the one genuinely interesting direction is log
+replication.** It would turn the fsync tradeoff from forced into chosen, make
+the single-node caveat in ADR-0007 a design decision rather than a limitation,
+and give the chaos suite a fault class it cannot currently express: a node that
+loses data and has to catch up from a peer.
