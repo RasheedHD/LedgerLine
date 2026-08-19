@@ -365,3 +365,23 @@ against whatever CI created rather than against what `migrations/` describes,
 and a broken migration passes. `internal/testdb` replays them itself, and CI
 round-trips them in a *separate* step, because "the schema is right" and "the
 migrations are reversible" are different claims.
+
+## 2026-08-19 (cont.) - the README
+
+**What we built:** A README that describes the system instead of an aspiration:
+architecture diagram, the six invariants with where each is enforced, the
+measured fsync numbers, a quickstart, the layout, and pointers into the ADRs.
+Removed the empty `bench/` directory - the Go benchmarks live beside the log,
+which is idiomatic, so the directory was a leftover from the original plan.
+
+**Key decision:** Lead with the claim the project exists to prove, not with a
+feature list. Anyone can list packages; the interesting thing is that
+at-least-once delivery plus idempotent processing gives exactly-once *effect*,
+and that there is a chaos suite which demonstrates it rather than asserting it.
+
+**Couldn't have written myself yet:** That a README has to be verified like
+code. I ran the exact quickstart in it end to end - migrations, server, the
+literal curl twice - and confirmed two 202s with offsets 0 and 1 and exactly one
+row in `events`. A README that lies about its own demo is worse than no README,
+because it is the first thing anyone tries and the first thing that loses their
+trust.

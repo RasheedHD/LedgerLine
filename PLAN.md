@@ -608,6 +608,7 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D39~~ | ~~Usage arriving for an already-posted period silently never billed~~ — **closed 2026-08-11** by ADR-0015. `events.invoice_id` makes "unbilled" queryable; the next period picks it up, which is also ADR-0001 §5's roll-forward | ADR-0015 | 6 |
 | ~~D40~~ | ~~Concurrent posting runs race~~ — **closed 2026-08-11.** `SELECT ... FOR UPDATE` on the period row. Mutation-tested: removing it fails the concurrency test 3 runs out of 3 | ADR-0015 | 6 |
 | ~~D43~~ | ~~Chaos suite runtime~~ — **closed 2026-08-19.** `-short` skips the seven scenarios; CI does not pass `-short` | ADR-0017 | 8 |
+| ~~D45~~ | ~~README describes an aspiration, not the system~~ — **closed 2026-08-19.** Architecture, the six invariants and where each is enforced, measured numbers, a verified quickstart, and pointers into the ADRs | — | 8 |
 | **D46** | Nothing runs the benchmarks in CI, so a log performance regression would go unnoticed. Benchmarks are noisy on shared runners and an untrustworthy number is worse than none | ADR-0017 | 8 |
 | **D44** | Every injected fault is one the system is designed to survive. Nothing yet injects one it should legitimately fail on — disk full during a segment roll, a torn record from power loss | ADR-0016 | 8 |
 | **D41** | Nothing creates periods on a schedule or decides when one should close, so a tenant with no open period accumulates unbilled events indefinitely | ADR-0015 | 8 |
@@ -693,24 +694,26 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-7 are done and CI is green.** 231 tests, none skipped, and
-`go test -race` passes on Linux — the first time the detector has ever run on
-this code. Group commit came through clean.
+**Phases 1-8 are essentially done.** 231 tests, CI green with the race detector,
+and the README now describes the system rather than an aspiration.
 
-**What remains is making the project legible to someone else.** The system is
-built and proven; nobody arriving at the repository can tell.
+**The one substantial thing left is `docs/interview-narrative.md`** — the
+five-minute walkthrough, the three hardest bugs, and what would be done
+differently. Eighteen learning-log entries hold the raw material and nothing has
+assembled it. That is the last piece of the stated goal: being able to defend
+this in an interview months from now.
 
-1. **The README (D45).** Still two sentences describing an aspiration. It should
-   describe what exists: the architecture, the six invariants and where each is
-   enforced, how to run it, and the measured numbers from ADR-0007 and ADR-0008.
-   This is the highest-value remaining work by a distance — it is what a reader
-   sees first and currently it undersells the whole project.
-2. **`docs/interview-narrative.md`.** The five-minute walkthrough, the three
-   hardest bugs, and what would be done differently. The learning log has the
-   raw material across seventeen entries; nothing has assembled it.
-3. **Smaller debt:** D10 (hardcoded dev DSN), D28 (`SyncEveryN` still reachable
-   behind an acknowledgement), D36/D37 (dead-letter tooling), D44 (no fault the
-   system should legitimately fail on), D46 (no benchmarks in CI).
+**Then only small debt remains**, none of it load-bearing:
 
-`bench/` is still an empty directory. The Go benchmarks live beside the log,
-which is idiomatic, so it should be deleted rather than filled.
+- **D10** hardcoded dev DSN in `cmd/ingest`
+- **D28** `SyncEveryN` is still reachable behind an acknowledgement, with nothing
+  in the type system preventing it
+- **D36 / D37** no tooling to resolve or replay a dead letter
+- **D42** late usage is billed at the next period's prices; needs plan
+  versioning (D34) to fix properly
+- **D44** every injected fault is one the system is designed to survive
+- **D46** no benchmarks in CI
+
+**Stretch, if the project continues:** log replication would make the fsync
+tradeoff a real choice rather than a forced one, and would turn the single-node
+caveat in ADR-0007 into a design decision instead of a limitation.
