@@ -27,6 +27,9 @@ const (
 	dsnPrefix  = "postgres://ledgerline:ledgerline@localhost:5432/"
 	dsnSuffix  = "?sslmode=disable"
 	namePrefix = "ledgerline_test"
+
+	// Set in CI. Turns "no database, skip" into "no database, fail".
+	requireDBEnv = "LEDGERLINE_REQUIRE_DB"
 )
 
 // CRITICAL: each package under test gets its own database.
@@ -76,9 +79,15 @@ var schemaOnce sync.Once
 // table empty.
 //
 // If no database is reachable the test is skipped, not failed. That keeps
-// `go test ./...` useful on a machine where Docker is not running, at the cost
-// of silently proving nothing — so CI must assert that these tests actually
-// ran rather than trusting a green result.
+// `go test ./...` useful on a machine where Docker is not running -- at the
+// cost that a green run then proves nothing at all.
+//
+// CRITICAL: set LEDGERLINE_REQUIRE_DB to turn that skip into a failure.
+//
+// CI sets it. Without it, a broken database connection in the pipeline shows up
+// as a passing build with every integration test quietly skipped, which is
+// strictly worse than a red one: the badge says the invariants hold when
+// nothing checked them.
 func New(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -97,7 +106,7 @@ func New(t *testing.T) *sql.DB {
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
-		t.Skipf("no test database reachable (try: docker compose up -d): %v", err)
+		skipOrFail(t, "no test database reachable (try: docker compose up -d)", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
@@ -120,7 +129,7 @@ func ensureDatabaseExists(t *testing.T, name string) bool {
 	defer admin.Close()
 
 	if err := admin.Ping(); err != nil {
-		t.Skipf("no Postgres reachable (try: docker compose up -d): %v", err)
+		skipOrFail(t, "no Postgres reachable (try: docker compose up -d)", err)
 		return false
 	}
 
@@ -265,4 +274,17 @@ func repoRoot(t *testing.T) string {
 		}
 		dir = parent
 	}
+}
+
+// skipOrFail skips when a database is merely unavailable, and fails when the
+// environment says one was required.
+//
+// That distinction is what stops CI from going green on a suite that never ran.
+func skipOrFail(t *testing.T, message string, cause error) {
+	t.Helper()
+
+	if os.Getenv(requireDBEnv) != "" {
+		t.Fatalf("%s: %v (%s is set, so a database is required)", message, cause, requireDBEnv)
+	}
+	t.Skipf("%s: %v", message, cause)
 }

@@ -593,11 +593,11 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D13~~ | ~~35-day backfill bound enforced nowhere~~ — **closed 2026-08-03.** Enforced, with its own `422 event_too_old` | ADR-0004 | 1 |
 | **D14** | Whether to store the original response body for Stripe-style replay, or only the id | ADR-0002 | 1 |
 | **D15** | Whether dedup belongs before or after the log write — broker's job or billing's | ADR-0002 | 3 |
-| **D16** | No CI, no task runner | — | 8 |
+| ~~D16~~ | ~~No CI~~ — **closed 2026-08-19.** GitHub Actions on Linux with a Postgres service: format, vet, build, race-enabled tests, a no-skips gate, and a migration round-trip | ADR-0017 | 8 |
 | **D18** | Every duplicate writes a dead tuple via the no-op `DO UPDATE`; autovacuum work scales with duplicate volume | ADR-0004 | 1 |
-| **D19** | Integration tests skip silently without a database, so a green `go test ./...` can prove nothing. CI must assert they ran | code | 8 |
+| ~~D19~~ | ~~Integration tests skip silently~~ — **closed 2026-08-19.** `LEDGERLINE_REQUIRE_DB` makes an unreachable database fatal, plus a CI gate that fails on any skipped test. Verified both ways against a dead port | ADR-0017 | 8 |
 | **D20** | Docker Desktop leaves undeletable stale socket reparse points on unclean exit, blocking every subsequent start. Cleared by renaming `%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine` | env | — |
-| **D21** | `go test -race` cannot run locally — the installed gcc is 32-bit only (`sorry, unimplemented: 64-bit mode not compiled in`). The log's concurrency is covered by a distinct-offsets test instead, which is weaker. CI on Linux would close this | env | 8 |
+| **D21** | **Addressed, NOT closed.** CI now runs `go test -race` on Linux, but it has never actually executed: the local gcc is 32-bit only and cannot build the race runtime. Group commit releases a lock around an fsync and coordinates waiters through a condition variable, which is exactly what a detector is built to find problems in. Closes when a run comes back green | ADR-0017 | 8 |
 | ~~D22~~ | ~~Dense in-memory position table~~ — **closed 2026-08-03.** Sparse on-disk index, 71 entries per 4000 records; open scales with segment count not record count | ADR-0007 | 2 |
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
 | ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
@@ -607,7 +607,8 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D35~~ | ~~Nothing connects priced line items to ledger transactions~~ — **closed 2026-08-11** by ADR-0014. `billing/posting` reads usage by period, prices it, and posts debit-receivable/credit-revenue. Verified end to end from HTTP to trial balance | ADR-0014 | 6 |
 | ~~D39~~ | ~~Usage arriving for an already-posted period silently never billed~~ — **closed 2026-08-11** by ADR-0015. `events.invoice_id` makes "unbilled" queryable; the next period picks it up, which is also ADR-0001 §5's roll-forward | ADR-0015 | 6 |
 | ~~D40~~ | ~~Concurrent posting runs race~~ — **closed 2026-08-11.** `SELECT ... FOR UPDATE` on the period row. Mutation-tested: removing it fails the concurrency test 3 runs out of 3 | ADR-0015 | 6 |
-| **D43** | The chaos suite takes ~20s; it needs a build tag or short-mode skip before it sits in front of every commit | ADR-0016 | 8 |
+| ~~D43~~ | ~~Chaos suite runtime~~ — **closed 2026-08-19.** `-short` skips the seven scenarios; CI does not pass `-short` | ADR-0017 | 8 |
+| **D46** | Nothing runs the benchmarks in CI, so a log performance regression would go unnoticed. Benchmarks are noisy on shared runners and an untrustworthy number is worse than none | ADR-0017 | 8 |
 | **D44** | Every injected fault is one the system is designed to survive. Nothing yet injects one it should legitimately fail on — disk full during a segment roll, a torn record from power loss | ADR-0016 | 8 |
 | **D41** | Nothing creates periods on a schedule or decides when one should close, so a tenant with no open period accumulates unbilled events indefinitely | ADR-0015 | 8 |
 | **D42** | Late usage is billed at the *next* period's prices. If prices changed in between, it is charged at the newer rate — needs plan versioning (D34) to fix properly | ADR-0015 | 6 |
@@ -643,6 +644,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0014](docs/adr/0014-posting-usage-to-the-ledger.md) | Posting usage to the ledger | Superseded by 0015 |
 | [0015](docs/adr/0015-periods-and-invoices.md) | Billing periods and invoices | Accepted |
 | [0016](docs/adr/0016-chaos-suite.md) | The chaos suite | Accepted |
+| [0017](docs/adr/0017-continuous-integration.md) | Continuous integration, and refusing to skip | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -691,31 +693,24 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-7 are done.** The README's claim is now a test that runs:
+**Phases 1-7 are done and CI exists.** 231 tests, none skipped locally.
 
-> a chaos suite that proves invoices stay correct to the cent
+**The immediate question is whether CI is green.** `go test -race` has never
+executed against this code, so the first workflow run is the first time the
+detector has ever seen group commit. It may fail, and that would be the pipeline
+earning its place on its first attempt. **D21 stays open until a run is green.**
 
-Seven chaos scenarios, eight consecutive clean full-suite runs, and
-mutation-checked — removing the dedup constraint fails two of them.
+**After that, what remains is making the project legible to someone else:**
 
-**What remains is Phase 8, and it is mostly about being legible to someone
-else:**
-
-1. **CI (D16, D19, D21).** The largest single gap. Integration tests still skip
-   silently without a database, so a green local run can prove nothing, and
-   `go test -race` has never once run over the group-commit code because this
-   machine's gcc is 32-bit only. Linux CI fixes both, and a passing badge is
-   what a reader checks first.
-2. **The README (D45).** It still describes an aspiration. It should describe
-   what exists: the architecture, the six invariants, how to run it, and the
-   measured numbers from ADR-0007 and ADR-0008.
-3. **`docs/interview-narrative.md`.** The five-minute walkthrough, the three
+1. **The README (D45).** It still describes an aspiration. It should describe
+   what exists: the architecture, the six invariants and where each is enforced,
+   how to run it, and the measured numbers from ADR-0007 and ADR-0008.
+2. **`docs/interview-narrative.md`.** The five-minute walkthrough, the three
    hardest bugs, and what would be done differently. The learning log has the
-   raw material for this and nothing has assembled it.
-4. **Smaller debt worth clearing:** D43 (chaos runtime), D10 (hardcoded dev
-   DSN), D36/D37 (dead-letter tooling), D28 (SyncEveryN is still reachable
-   behind an acknowledgement).
+   raw material; nothing has assembled it.
+3. **Smaller debt:** D10 (hardcoded dev DSN), D28 (`SyncEveryN` still reachable
+   behind an acknowledgement), D36/D37 (dead-letter tooling), D44 (no fault the
+   system should legitimately fail on), D46 (no benchmarks in CI).
 
-Phase 4's `bench/` directory is also still empty — the Go benchmarks live
-beside the log, which is idiomatic, so that directory should probably be
-deleted rather than filled.
+`bench/` is still an empty directory. The Go benchmarks live beside the log,
+which is idiomatic, so it should be deleted rather than filled.

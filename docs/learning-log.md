@@ -344,3 +344,24 @@ and wiped offset stores all go backward. An unrealistic fault reports bugs that
 cannot happen and buries the ones that can. The second: fault injectors calling
 `t.Fatal` from their own goroutines, which Go doesn't permit and which turned
 the suite's own deliberate connection kills into failures.
+
+## 2026-08-19 (cont.) - CI, and refusing to skip
+
+**What we built:** GitHub Actions on Linux with a Postgres 16 service container:
+format, vet, build, `go test -race` over everything including chaos, a no-skips
+gate, and a migration round-trip. `.gitattributes` to end the LF/CRLF warnings.
+`-short` now skips the chaos scenarios. ADR-0017. Closes D16, D19, D43.
+
+**Key decision:** `LEDGERLINE_REQUIRE_DB` turns a skipped integration test into a
+failure. Without it a broken service container produces a *passing* build with
+every database test quietly skipped, which is strictly worse than a red build:
+the badge then claims the invariants hold when nothing checked them. A green CI
+that proves nothing is an active lie; a red one is just bad news. Verified both
+ways against a dead port.
+
+**Couldn't have written myself yet:** That CI should apply no migrations. The
+instinct is to have the pipeline set up the schema, but then the tests run
+against whatever CI created rather than against what `migrations/` describes,
+and a broken migration passes. `internal/testdb` replays them itself, and CI
+round-trips them in a *separate* step, because "the schema is right" and "the
+migrations are reversible" are different claims.

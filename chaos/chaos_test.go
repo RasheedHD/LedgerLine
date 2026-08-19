@@ -10,6 +10,19 @@ import (
 	"time"
 )
 
+// skipIfShort keeps the chaos suite out of the fast feedback loop.
+//
+// These scenarios take roughly twenty seconds together, and considerably longer
+// under -race. That is fine for CI and too slow for the loop you run on every
+// save, so `go test -short ./...` skips them. CI runs without -short, which is
+// the only place the distinction matters.
+func skipIfShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("chaos scenarios are slow; run without -short")
+	}
+}
+
 // assertInvariants fails the test with every violation found, not just the
 // first. Under chaos, several usually break together and the first one is
 // rarely the most informative.
@@ -69,6 +82,7 @@ func assertInvoiceToTheCent(t *testing.T, h *Harness) {
 // offset and the events it covers must move together, so an interrupted drain
 // resumes without losing or repeating anything.
 func TestConsumerInterruptedRepeatedly(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 	rng := rand.New(rand.NewSource(1))
 
@@ -93,6 +107,7 @@ func TestConsumerInterruptedRepeatedly(t *testing.T) {
 // This is a failover or a connection reaper. Transactions die part-way, which
 // is the window where a half-applied batch would show up.
 func TestDatabaseConnectionsKilledDuringDrain(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 
 	postN(t, h, "kill", 80)
@@ -124,6 +139,7 @@ func TestDatabaseConnectionsKilledDuringDrain(t *testing.T) {
 // duplicates are byte-identical replays of records already on the log, which is
 // exactly what a redelivering broker produces.
 func TestEveryRecordDeliveredTwice(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 
 	postN(t, h, "twice", 60)
@@ -154,6 +170,7 @@ func TestEveryRecordDeliveredTwice(t *testing.T) {
 //
 // Every rewind replays records already applied. Nothing may be billed twice.
 func TestOffsetRewoundRepeatedly(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 	rng := rand.New(rand.NewSource(7))
 
@@ -178,6 +195,7 @@ func TestOffsetRewoundRepeatedly(t *testing.T) {
 // invoice with no ledger entry, events marked as billed with nothing billing
 // them, or a period claiming closed with no invoice at all.
 func TestCloseInterruptedRepeatedly(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 	rng := rand.New(rand.NewSource(3))
 
@@ -227,6 +245,7 @@ func TestCloseInterruptedRepeatedly(t *testing.T) {
 // INVARIANT I4 under fault: an invoice that has been issued never changes,
 // however much chaos follows it.
 func TestClosedInvoicesSurviveEverything(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 
 	postN(t, h, "immutable", 50)
@@ -272,6 +291,7 @@ func TestClosedInvoicesSurviveEverything(t *testing.T) {
 //
 // This is the test the README's last clause is about.
 func TestEverythingAtOnce(t *testing.T) {
+	skipIfShort(t)
 	h := NewHarness(t)
 	rng := rand.New(rand.NewSource(11))
 

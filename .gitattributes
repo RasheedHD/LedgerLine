@@ -1,0 +1,10 @@
+# Normalise line endings in the repository regardless of the checkout platform.
+#
+# Development happens on Windows and CI runs on Linux. Without this, every
+# commit warns about LF/CRLF conversion and a stray CRLF in a .go file makes
+# `gofmt -l` fail in CI for a reason that has nothing to do with the code.
+* text=auto eol=lf
+
+# SQL and shell scripts are read by containers, where a CR is a syntax error.
+*.sql text eol=lf
+*.sh  text eol=lf

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # The test harness builds its own per-package databases from this one, so
+      # the only thing needed here is a reachable server with matching
+      # credentials. Migrations are applied by internal/testdb, not by CI, so
+      # the schema under test is always exactly what migrations/ describes.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ledgerline
+          POSTGRES_PASSWORD: ledgerline
+          POSTGRES_DB: ledgerline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # CRITICAL: turns "no database, skip" into "no database, fail".
+      #
+      # Without it a broken service container shows up as a green build with
+      # every integration test quietly skipped -- strictly worse than a red one,
+      # because the badge then claims the invariants hold when nothing checked
+      # them.
+      LEDGERLINE_REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The whole point of running CI on Linux.
+      #
+      # -race has never run on the development machine, whose gcc is 32-bit only
+      # and cannot build the race runtime. Group commit in broker/log is the most
+      # concurrency-sensitive code in the project and this is its first real
+      # detector run. Chaos scenarios are included: -short is NOT passed.
+      - name: Test with the race detector
+        run: go test -race -count=1 ./...
+
+      # A green result is only meaningful if the integration tests actually ran.
+      # LEDGERLINE_REQUIRE_DB should already make a missing database fatal; this
+      # catches a test skipping for some other reason nobody noticed.
+      - name: Assert nothing was skipped
+        run: |
+          go test -count=1 -v ./... 2>&1 | tee test.log
+          if grep -q -- "--- SKIP" test.log; then
+            echo "Some tests were skipped, which CI does not accept:"
+            grep -B2 -- "--- SKIP" test.log
+            exit 1
+          fi
+
+      - name: Migrations round-trip
+        run: |
+          go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
+          URL="postgres://ledgerline:ledgerline@localhost:5432/ledgerline?sslmode=disable"
+          migrate -path migrations -database "$URL" up
+          migrate -path migrations -database "$URL" down -all
+          migrate -path migrations -database "$URL" up
