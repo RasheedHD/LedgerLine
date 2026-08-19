@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -360,5 +361,97 @@ func TestRejectsForeignFile(t *testing.T) {
 
 	if _, err := Open(dir, Options{}); !errors.Is(err, ErrBadMagic) {
 		t.Fatalf("error = %v, want ErrBadMagic -- an unrecognised file must not be truncated to nothing", err)
+	}
+}
+
+// A policy that acknowledges before syncing must be refused by OpenDurable.
+//
+// This is the runtime half of D28. The compile-time half is that
+// ingest.NewHandler takes a *DurableLog, so a plain *Log cannot be passed at
+// all -- which no test can express, because the code that would prove it does
+// not compile.
+func TestOpenDurableRefusesPoliciesThatAcknowledgeEarly(t *testing.T) {
+	tests := []struct {
+		name    string
+		proves  string
+		policy  SyncPolicy
+		durable bool
+	}{
+		{
+			name:    "SyncNever",
+			proves:  "leaving the flush to the operating system means an acknowledged record can vanish with the machine",
+			policy:  SyncNever,
+			durable: false,
+		},
+		{
+			name:    "SyncEveryN",
+			proves:  "the whole point of D28: with N=1000, records 1 to 999 return with no sync behind them",
+			policy:  SyncEveryN,
+			durable: false,
+		},
+		{
+			name:    "SyncAlways",
+			proves:  "an fsync per append is durable, just prohibitively slow",
+			policy:  SyncAlways,
+			durable: true,
+		},
+		{
+			name:    "SyncGroup",
+			proves:  "group commit gives the same guarantee at a usable rate, which is why it exists",
+			policy:  SyncGroup,
+			durable: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.policy.Durable(); got != tc.durable {
+				t.Errorf("Durable() = %v, want %v\nthis case proves: %s", got, tc.durable, tc.proves)
+			}
+
+			l, err := OpenDurable(t.TempDir(), Options{Sync: tc.policy})
+			if tc.durable {
+				if err != nil {
+					t.Fatalf("OpenDurable rejected a durable policy: %v", err)
+				}
+				l.Close()
+				return
+			}
+			if err == nil {
+				l.Close()
+				t.Fatalf("OpenDurable accepted %s, which acknowledges records before they are on disk\nthis case proves: %s",
+					tc.policy, tc.proves)
+			}
+			// The error has to name the policy, or an operator reading a startup
+			// failure cannot tell which setting was wrong.
+			if !strings.Contains(err.Error(), tc.policy.String()) {
+				t.Errorf("error does not name the policy: %v", err)
+			}
+		})
+	}
+}
+
+// A DurableLog is a Log for every other purpose, so nothing else has to change
+// to accept one.
+func TestDurableLogBehavesLikeALog(t *testing.T) {
+	l, err := OpenDurable(t.TempDir(), Options{Sync: SyncGroup})
+	if err != nil {
+		t.Fatalf("OpenDurable: %v", err)
+	}
+	defer l.Close()
+
+	offset, err := l.Append([]byte("through the embedded Log"))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	payload, err := l.Read(offset)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(payload) != "through the embedded Log" {
+		t.Errorf("read back %q", payload)
+	}
+	if l.NextOffset() != 1 {
+		t.Errorf("NextOffset = %d, want 1", l.NextOffset())
 	}
 }

@@ -68,7 +68,7 @@ func NewHarness(t *testing.T) *Harness {
 	// SyncGroup: ingest answers 202 on the strength of the append, so the
 	// append has to be durable before it returns. Chaos with a weaker policy
 	// would be testing a system nobody should run.
-	l, err := brokerlog.Open(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
+	l, err := brokerlog.OpenDurable(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
 	if err != nil {
 		t.Fatalf("open log: %v", err)
 	}
@@ -92,9 +92,9 @@ func NewHarness(t *testing.T) *Harness {
 
 	return &Harness{
 		DB:        db,
-		Log:       l,
+		Log:       l.Log,
 		Server:    server,
-		Consumer:  consumer.New("billing", l, db, consumer.Options{BatchSize: 7}),
+		Consumer:  consumer.New("billing", l.Log, db, consumer.Options{BatchSize: 7}),
 		Invoicing: invoicing.New(db, ledgerStore, registry),
 		Ledger:    ledgerStore,
 		Plan: pricing.Plan{Name: "chaos", Prices: []pricing.Price{

@@ -53,7 +53,7 @@ func main() {
 	// power loss -- invariant I3 broken by construction. SyncGroup gives the
 	// same guarantee as fsyncing every append while letting concurrent requests
 	// share one flush. See ADR-0008.
-	brokerLog, err := brokerlog.Open(logDir, brokerlog.Options{Sync: brokerlog.SyncGroup})
+	brokerLog, err := brokerlog.OpenDurable(logDir, brokerlog.Options{Sync: brokerlog.SyncGroup})
 	if err != nil {
 		log.Fatalf("open log: %v", err)
 	}
@@ -82,7 +82,9 @@ func main() {
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		runConsumer(ctx, brokerLog, db)
+		// .Log unwraps to the plain type: the consumer reads the log and
+		// acknowledges nobody, so it has no need of the durable guarantee.
+		runConsumer(ctx, brokerLog.Log, db)
 	}()
 
 	mux := http.NewServeMux()

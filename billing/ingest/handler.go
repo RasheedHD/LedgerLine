@@ -74,7 +74,7 @@ type errorBody struct {
 
 // Handler serves POST /events.
 type Handler struct {
-	log *brokerlog.Log
+	log *brokerlog.DurableLog
 
 	// Injected so the clock-skew and backfill-window rules can be tested at
 	// fixed instants instead of relative to whenever the suite happens to run.
@@ -83,14 +83,18 @@ type Handler struct {
 
 // NewHandler returns the POST /events handler.
 //
-// CRITICAL: the log passed here must use brokerlog.SyncGroup.
+// CRITICAL: it takes a *DurableLog, not a *Log, and that is the whole point.
 //
-// This handler returns 202 on the strength of the append, so the append has to
-// be genuinely durable before it returns. Under SyncNever or SyncEveryN the
-// record may still be only in the page cache, and the 202 becomes a promise the
-// system cannot keep across a power failure -- invariant I3 broken by
-// construction. See ADR-0008.
-func NewHandler(l *brokerlog.Log) *Handler {
+// This handler returns 202 on the strength of the append, so the append must be
+// genuinely durable before it returns. Under SyncNever or SyncEveryN the record
+// may still be only in the page cache, and the 202 becomes a promise the system
+// cannot keep across a power failure -- invariant I3 broken by construction.
+//
+// That rule used to live here as a comment, which stops nobody. brokerlog.
+// OpenDurable is the only way to get a *DurableLog and refuses a policy that
+// acknowledges early, so the mistake now fails to compile rather than failing in
+// production. See ADR-0018.
+func NewHandler(l *brokerlog.DurableLog) *Handler {
 	return &Handler{log: l, now: time.Now}
 }
 

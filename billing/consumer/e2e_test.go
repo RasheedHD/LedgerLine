@@ -39,7 +39,7 @@ func newPipeline(t *testing.T) (*httptest.Server, *brokerlog.Log, *consumer.Cons
 
 	// SyncGroup, as the handler documents it requires: the 202 is only honest
 	// if the append behind it is durable.
-	l, err := brokerlog.Open(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
+	l, err := brokerlog.OpenDurable(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
 	if err != nil {
 		t.Fatalf("open log: %v", err)
 	}
@@ -50,7 +50,7 @@ func newPipeline(t *testing.T) (*httptest.Server, *brokerlog.Log, *consumer.Cons
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	return server, l, consumer.New("billing", l, db, consumer.Options{}), db
+	return server, l.Log, consumer.New("billing", l.Log, db, consumer.Options{}), db
 }
 
 func postEvent(t *testing.T, server *httptest.Server, key, quantity string) int {

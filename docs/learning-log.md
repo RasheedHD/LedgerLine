@@ -407,3 +407,25 @@ belongs in the document as its own section. Being able to name where intuition
 failed - `kill -9` cannot tear a record, and the overflow test that was wrong
 rather than the code - is worth more in a conversation than another correct
 answer, because it is the part that cannot be memorised from a README.
+
+## 2026-08-19 (cont.) - a distinct type for a durable log
+
+**What we built:** `brokerlog.DurableLog` and `OpenDurable`, plus
+`SyncPolicy.Durable()`. `ingest.NewHandler` now takes `*DurableLog`, so wiring
+it onto a policy that acknowledges before syncing fails to compile. Closes D28,
+the last real footgun. ADR-0018. 237 tests.
+
+**Key decision:** A wrapper type rather than a runtime check. An error returned
+from `NewHandler` would catch it too, but only after the program started, on a
+path someone might not exercise before shipping. A type mismatch is found by
+`go build`. Verified with a probe program that used to compile and now does not.
+
+**Couldn't have written myself yet:** That this should be a guardrail rather
+than a prison. The inner log is reachable as `.Log`, and the consumer uses it
+deliberately, because it reads the log and acknowledges nobody so the durable
+guarantee is irrelevant to it. Making the unsafe path *impossible* would have
+forced every non-acknowledging component to carry a guarantee it does not need;
+making it *deliberate* leaves a visible `.Log` at the call site marking the
+choice. Also decided to keep `SyncEveryN` rather than delete it - a dial with a
+setting removed because it was misusable explains less than a dial that cannot
+be misused where it matters.

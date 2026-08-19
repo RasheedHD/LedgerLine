@@ -25,13 +25,15 @@ import (
 func newTestHandler(t *testing.T) (*Handler, *brokerlog.Log) {
 	t.Helper()
 
-	l, err := brokerlog.Open(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
+	l, err := brokerlog.OpenDurable(t.TempDir(), brokerlog.Options{Sync: brokerlog.SyncGroup})
 	if err != nil {
 		t.Fatalf("open log: %v", err)
 	}
 	t.Cleanup(func() { l.Close() })
 
-	return &Handler{log: l, now: func() time.Time { return testNow }}, l
+	// The handler keeps the durable type; the test reads through the plain
+	// one, which is all a reader needs.
+	return &Handler{log: l, now: func() time.Time { return testNow }}, l.Log
 }
 
 func post(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {

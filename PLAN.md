@@ -601,7 +601,7 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D22~~ | ~~Dense in-memory position table~~ — **closed 2026-08-03.** Sparse on-disk index, 71 entries per 4000 records; open scales with segment count not record count | ADR-0007 | 2 |
 | ~~D23~~ | ~~No fsync policy~~ — **closed 2026-08-03.** Dial added and measured: SyncAlways 244×, SyncEveryN(1000) 1.5×. Default stays SyncNever; the caller owns the choice | ADR-0007 | 2 |
 | ~~D26~~ | ~~`SyncEveryN` acknowledges records before they are durable~~ — **closed 2026-08-03** by ADR-0008. `SyncGroup` gives `SyncAlways`'s guarantee at 7.2× its throughput under 64 writers, batching ~16 records per fsync | ADR-0008 | 3 |
-| **D28** | `SyncEveryN` is still in the API and still unsafe behind an acknowledgement; nothing in the type system prevents that mistake. A `Durable() bool` on the policy, or splitting the enum, would | ADR-0008 | 8 |
+| ~~D28~~ | ~~`SyncEveryN` reachable behind an acknowledgement~~ — **closed 2026-08-19.** `ingest.NewHandler` takes a `*DurableLog`, obtainable only from `OpenDurable`, which refuses a policy that acknowledges early. The unsafe wiring no longer compiles | ADR-0018 | 8 |
 | **D33** | `Quantity` is `int64` nanos (~9.2 billion units), **narrower than the `NUMERIC(38,9)` column it comes from** and than ingest's own 29-digit bound. A quantity can pass ingest and fail to price | ADR-0011 | 4 |
 | **D34** | Plans and meters live in memory with no persistence or versioning, so there is no answer to "what did this plan look like when that invoice was cut" | ADR-0011 | 6 |
 | ~~D35~~ | ~~Nothing connects priced line items to ledger transactions~~ — **closed 2026-08-11** by ADR-0014. `billing/posting` reads usage by period, prices it, and posts debit-receivable/credit-revenue. Verified end to end from HTTP to trial balance | ADR-0014 | 6 |
@@ -647,6 +647,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0015](docs/adr/0015-periods-and-invoices.md) | Billing periods and invoices | Accepted |
 | [0016](docs/adr/0016-chaos-suite.md) | The chaos suite | Accepted |
 | [0017](docs/adr/0017-continuous-integration.md) | Continuous integration, and refusing to skip | Accepted |
+| [0018](docs/adr/0018-durable-log-type.md) | A distinct type for a log safe to acknowledge from | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -695,24 +696,23 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**The project is complete against its stated goal.** Phases 1-8 done, 231 tests,
-CI green under `-race`, six migrations, seventeen ADRs, a README that describes
-the system, and an interview narrative assembled from eighteen sessions of
-learning-log entries.
+**The project is complete against its stated goal, and the last real footgun is
+closed.** 237 tests, CI green under `-race`, six migrations, eighteen ADRs.
 
-**What remains is optional polish**, none of it load-bearing:
+Wiring ingest onto a log that acknowledges before syncing is now a **compile
+error** rather than a comment nobody reads.
+
+**What is left is optional and none of it load-bearing:**
 
 - **D10** hardcoded dev DSN in `cmd/ingest`
-- **D28** `SyncEveryN` is still reachable behind an acknowledgement, with nothing
-  in the type system preventing it — the one remaining footgun worth closing
 - **D36 / D37** no tooling to resolve or replay a dead letter
 - **D42** late usage is billed at the next period's prices; needs plan
   versioning (D34)
 - **D44** every injected fault is one the system is designed to survive
 - **D46** no benchmarks in CI
 
-**If the project continues, the one genuinely interesting direction is log
-replication.** It would turn the fsync tradeoff from forced into chosen, make
-the single-node caveat in ADR-0007 a design decision rather than a limitation,
-and give the chaos suite a fault class it cannot currently express: a node that
-loses data and has to catch up from a peer.
+**The one genuinely interesting direction left is log replication.** It would
+turn the fsync tradeoff from forced into chosen, make the single-node caveat in
+ADR-0007 a design decision rather than a limitation, and give the chaos suite a
+fault class it cannot currently express: a node that loses data and has to catch
+up from a peer.

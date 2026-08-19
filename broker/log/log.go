@@ -55,6 +55,32 @@ const (
 	SyncGroup
 )
 
+// Durable reports whether a record is on disk by the time Append returns.
+//
+// The distinction that matters: SyncEveryN and SyncNever acknowledge records
+// that may still be only in the page cache. They are safe where losing a
+// bounded tail is acceptable, and unsafe as the basis for telling a client
+// their usage is stored.
+func (p SyncPolicy) Durable() bool {
+	return p == SyncAlways || p == SyncGroup
+}
+
+// String names the policy, so an error about the wrong one is readable.
+func (p SyncPolicy) String() string {
+	switch p {
+	case SyncNever:
+		return "SyncNever"
+	case SyncAlways:
+		return "SyncAlways"
+	case SyncEveryN:
+		return "SyncEveryN"
+	case SyncGroup:
+		return "SyncGroup"
+	default:
+		return "unknown sync policy"
+	}
+}
+
 // Options configures a Log.
 type Options struct {
 	// MaxSegmentBytes is the size at which the active segment is closed and a
@@ -343,4 +369,43 @@ func (l *Log) Close() error {
 	}
 	l.segments = nil
 	return firstErr
+}
+
+// DurableLog is a Log whose policy puts every record on disk before Append
+// returns.
+//
+// CRITICAL: this type exists so the compiler enforces what a comment used to.
+//
+// Anything that acknowledges a client -- ingest answering 202 -- must not run on
+// a policy that returns before syncing, or the acknowledgement is a promise the
+// system cannot keep across a power failure. That rule was previously written
+// only in a doc comment on NewHandler, which stops nobody.
+//
+// Taking *DurableLog instead of *Log makes the mistake fail to compile rather
+// than fail in production. OpenDurable is the only way to obtain one, and it
+// refuses a policy that is not durable.
+//
+// The embedded *Log promotes every one of its methods -- Append, Read, Close and
+// the rest -- so a DurableLog is usable anywhere a Log is, without wrapping each
+// method by hand. It is a guardrail rather than a prison: the inner Log is
+// reachable as .Log, which is fine, because the point is to make the unsafe
+// path deliberate rather than impossible to type.
+type DurableLog struct {
+	*Log
+}
+
+// OpenDurable opens a log and refuses a sync policy that acknowledges records
+// before they are on disk.
+func OpenDurable(dir string, opts Options) (*DurableLog, error) {
+	if !opts.Sync.Durable() {
+		return nil, fmt.Errorf(
+			"log: %s acknowledges records before they are durable; a log used behind an acknowledgement needs SyncAlways or SyncGroup",
+			opts.Sync)
+	}
+
+	l, err := Open(dir, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &DurableLog{Log: l}, nil
 }
