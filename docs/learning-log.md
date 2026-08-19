@@ -320,3 +320,27 @@ gather the same events, and the failure lands somewhere downstream where it is
 much harder to reason about. Also learned to drop the `closing` state: it only
 earns its place when closing is long-running and observable half-done, and a
 state nobody can ever see is one that eventually gets handled wrong.
+
+## 2026-08-19 — the chaos suite
+
+**What we built:** `chaos/` — seven scenarios that break the running system and
+check I1–I4 held: consumer killed mid-drain, every database connection
+terminated, every record delivered twice, the offset rewound, the period close
+interrupted mid-transaction, and all of it at once under concurrent load. Each
+ends by closing the books and asserting the invoice equals one cent per
+acknowledged event. ADR-0016. Phase 7 done.
+
+**Key decision:** Compute the expected total from what ingest *acknowledged*,
+using arithmetic that never consults anything the system stored. If the suite
+and the system agreed only because both derived the number the same way, the
+suite would prove nothing.
+
+**Couldn't have written myself yet:** Both bugs the suite found were in the
+suite. The worst was `RewindConsumer` writing the offset unconditionally — when
+the consumer was *behind* the chosen value it moved **forward**, skipping
+records, losing 11 of 180 acknowledged events, and looking exactly like the
+system violating I3. No real fault skips a consumer forward: restored backups
+and wiped offset stores all go backward. An unrealistic fault reports bugs that
+cannot happen and buries the ones that can. The second: fault injectors calling
+`t.Fatal` from their own goroutines, which Go doesn't permit and which turned
+the suite's own deliberate connection kills into failures.

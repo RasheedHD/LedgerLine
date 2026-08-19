@@ -154,7 +154,7 @@ Target shape at project completion:
 | `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
 | `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
-| `chaos/` | Fault injection, invariant assertions | Empty |
+| `chaos/` | Fault injection, invariant assertions | Done: 7 scenarios, mutation-checked |
 | `migrations/` | golang-migrate SQL | 1 migration |
 | `docs/adr/` | Design decisions | 3 ADRs |
 
@@ -607,6 +607,8 @@ Append-only. Close items by marking them, not deleting them.
 | ~~D35~~ | ~~Nothing connects priced line items to ledger transactions~~ — **closed 2026-08-11** by ADR-0014. `billing/posting` reads usage by period, prices it, and posts debit-receivable/credit-revenue. Verified end to end from HTTP to trial balance | ADR-0014 | 6 |
 | ~~D39~~ | ~~Usage arriving for an already-posted period silently never billed~~ — **closed 2026-08-11** by ADR-0015. `events.invoice_id` makes "unbilled" queryable; the next period picks it up, which is also ADR-0001 §5's roll-forward | ADR-0015 | 6 |
 | ~~D40~~ | ~~Concurrent posting runs race~~ — **closed 2026-08-11.** `SELECT ... FOR UPDATE` on the period row. Mutation-tested: removing it fails the concurrency test 3 runs out of 3 | ADR-0015 | 6 |
+| **D43** | The chaos suite takes ~20s; it needs a build tag or short-mode skip before it sits in front of every commit | ADR-0016 | 8 |
+| **D44** | Every injected fault is one the system is designed to survive. Nothing yet injects one it should legitimately fail on — disk full during a segment roll, a torn record from power loss | ADR-0016 | 8 |
 | **D41** | Nothing creates periods on a schedule or decides when one should close, so a tenant with no open period accumulates unbilled events indefinitely | ADR-0015 | 8 |
 | **D42** | Late usage is billed at the *next* period's prices. If prices changed in between, it is charged at the newer rate — needs plan versioning (D34) to fix properly | ADR-0015 | 6 |
 | ~~D29~~ | ~~Conflicts and undecodable records not stored anywhere actionable~~ — **closed 2026-08-11** by ADR-0013. `dead_letters` stores the raw record, reason, tenant and key, written in the batch transaction. `Stats.Accounted()` states I3 as an arithmetic identity | ADR-0013 | 3 |
@@ -640,6 +642,7 @@ Append-only. Close items by marking them, not deleting them.
 | [0013](docs/adr/0013-dead-letters.md) | Dead letters | Accepted |
 | [0014](docs/adr/0014-posting-usage-to-the-ledger.md) | Posting usage to the ledger | Superseded by 0015 |
 | [0015](docs/adr/0015-periods-and-invoices.md) | Billing periods and invoices | Accepted |
+| [0016](docs/adr/0016-chaos-suite.md) | The chaos suite | Accepted |
 
 Planned: validation and error taxonomy · dedup table shape and fingerprinting ·
 test strategy · segment format · fsync policy · index density · delivery
@@ -688,32 +691,31 @@ meter registry · chart of accounts · period state machine.
 
 ## 11. The immediate next step
 
-**Phases 1-6 are done. Every invariant I1-I6 now has enforcement somewhere.**
-224 tests, none skipped. Six migrations, round-tripping cleanly.
+**Phases 1-7 are done.** The README's claim is now a test that runs:
 
-| Invariant | Enforced by |
-|---|---|
-| I1 money conserved | Balanced-by-construction transfers + deferred DB trigger |
-| I2 no double billing | Unique constraint + derived ledger idempotency keys |
-| I3 nothing silently lost | `dead_letters` + `Stats.Accounted()` |
-| I4 closed invoices immutable | `BEFORE UPDATE OR DELETE` triggers |
-| I5 deterministic replay | Pure rating, sorted output, offset-in-transaction |
-| I6 no float | AST-walking test over all of `billing/` |
+> a chaos suite that proves invoices stay correct to the cent
 
-**Next: Phase 7, the chaos suite.** It is now the right thing and was not
-before: chaos asserts I1-I6 *together under injected faults*, and until this
-session several of them had nothing to assert. `chaos/` is still empty and it is
-the README's last unfulfilled clause — "a chaos suite that proves invoices stay
-correct to the cent".
+Seven chaos scenarios, eight consecutive clean full-suite runs, and
+mutation-checked — removing the dedup constraint fails two of them.
 
-The faults worth injecting, roughly in order of what they would actually catch:
+**What remains is Phase 8, and it is mostly about being legible to someone
+else:**
 
-1. Kill the consumer between processing and offset commit → I2
-2. Kill during a period close → I1, I4 (does a half-closed period exist?)
-3. Deliver every record twice → I2
-4. Drop the database mid-batch → I3
-5. Clock skew across ingest and close → I4
+1. **CI (D16, D19, D21).** The largest single gap. Integration tests still skip
+   silently without a database, so a green local run can prove nothing, and
+   `go test -race` has never once run over the group-commit code because this
+   machine's gcc is 32-bit only. Linux CI fixes both, and a passing badge is
+   what a reader checks first.
+2. **The README (D45).** It still describes an aspiration. It should describe
+   what exists: the architecture, the six invariants, how to run it, and the
+   measured numbers from ADR-0007 and ADR-0008.
+3. **`docs/interview-narrative.md`.** The five-minute walkthrough, the three
+   hardest bugs, and what would be done differently. The learning log has the
+   raw material for this and nothing has assembled it.
+4. **Smaller debt worth clearing:** D43 (chaos runtime), D10 (hardcoded dev
+   DSN), D36/D37 (dead-letter tooling), D28 (SyncEveryN is still reachable
+   behind an acknowledgement).
 
-After that: **CI** (D16, D19, D21), which is the only way to run `go test -race`
-over group commit, and **Phase 8** polish — the README still describes a project
-rather than this one.
+Phase 4's `bench/` directory is also still empty — the Go benchmarks live
+beside the log, which is idiomatic, so that directory should probably be
+deleted rather than filled.
