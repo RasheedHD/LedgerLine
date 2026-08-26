@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # So a run can be started by hand from the Actions tab or `gh workflow run`,
+  # which is the only recourse when push events are not producing runs.
+  workflow_dispatch:
 
 jobs:
   test:
