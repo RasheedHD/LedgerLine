@@ -4,6 +4,23 @@ This is a portfolio project I'm using to learn distributed systems and
 billing correctness. You write most of the code. My job is to understand
 most lines well enough to defend them in a technical interview months from now.
 
+## Read this first
+
+**[PLAN.md](PLAN.md) is the anchor document.** Read it before doing anything
+else in a new session - section 4 says where the project actually is, section 7
+is the debt register, and section 11 says what to do next. Update it at the end
+of the session.
+
+The other documents and what each is for:
+
+- **[docs/adr/](docs/adr/)** - one record per design decision, including the
+  superseded ones. Never edit an accepted ADR except to add a superseded header.
+- **[docs/learning-log.md](docs/learning-log.md)** - what I learned, appended
+  every session, under 10 lines.
+- **[docs/interview-narrative.md](docs/interview-narrative.md)** - the assembled
+  version of the above, for revision.
+- **[README.md](README.md)** - what the project is, for someone arriving cold.
+
 ## Priority
 
 Build well-made software that stands up as a portfolio piece. Correctness,
@@ -44,9 +61,12 @@ things you can decide sensibly yourself.
 These are the interview conversation. Everything else supports them, and they
 deserve the most care, the best tests, and the clearest comments.
 
-- billing/dedup/ - idempotency and deduplication
+- broker/log/ - segment format, sparse index, crash recovery, group commit
 - billing/ledger/ - double-entry posting logic
-- broker/log/ - segment format and offset index
+- billing/consumer/ - idempotency, deduplication, and the exactly-once seam
+
+(Deduplication has no package of its own. It is the unique constraint on
+`events` plus the consumer that applies it; there is no `billing/dedup/`.)
 
 ## After every session
 

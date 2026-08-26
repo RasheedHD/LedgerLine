@@ -5,7 +5,7 @@
 > is the highest-priority work in the repo, because everything else is
 > navigated from here.
 
-- **Last updated:** 2026-08-03
+- **Last updated:** 2026-08-19
 - **Repo:** `github.com/RasheedHD/LedgerLine`
 - **Working agreement:** [CLAUDE.md](CLAUDE.md) — build first, walk through
   after. The tutoring loop is paused; priority is a portfolio-grade result.
@@ -74,8 +74,8 @@ If a task doesn't serve the thesis sentence, it doesn't belong in this repo.
 ## 2. The invariants
 
 These are the properties that must never break. They are numbered so tests,
-ADRs, and commit messages can cite them. **The chaos suite in Phase 7 exists
-to assert exactly these under fault injection.**
+ADRs, and commit messages can cite them. **The chaos suite in `chaos/` asserts
+I1-I4 together under fault injection.**
 
 | ID | Invariant | Why it matters |
 |---|---|---|
@@ -95,7 +95,7 @@ retrofitting determinism is close to a rewrite.
 
 ## 3. Architecture
 
-Target shape at project completion:
+This is what is built, not a target:
 
 ```
                     ┌─────────────────────────────────────────┐
@@ -119,7 +119,8 @@ Target shape at project completion:
                     │   └──────┬───────┘  → duplicates HAPPEN │
                     │          ▼                              │
                     │   ┌──────────────┐                      │
-                    │   │billing/dedup │  ← I2 enforced here  │
+                    │   │  dedup: the  │  ← I2 enforced here  │
+                    │   │  DB constraint│                     │
                     │   └──────┬───────┘                      │
                     │          ▼                              │
                     │   ┌──────────────┐                      │
@@ -135,8 +136,7 @@ Target shape at project completion:
                     │   │  invoicing   │  ← I4 enforced here  │
                     │   └──────────────┘  period state machine│
                     │                                         │
-                    │   chaos/  ──breaks──▶ asserts I1–I6     │
-                    │   bench/  ──measures──▶ throughput, p99 │
+                    │   chaos/  ──breaks──▶ asserts I1–I4     │
                     └─────────────────────────────────────────┘
 ```
 
@@ -146,19 +146,19 @@ Target shape at project completion:
 |---|---|---|
 | `cmd/ingest/` | Process entry point, log + DB wiring, HTTP server, consumer loop | Done: graceful shutdown, DB-optional startup |
 | `billing/ingest/` | HTTP handler, decode, validate, append to log | Done: no database dependency |
-| `billing/dedup/` | Idempotency and deduplication | Enforced in `billing/ingest` + the DB constraint; no separate package |
+| *(no `billing/dedup/`)* | Deduplication is the unique constraint plus `billing/consumer`; there is no separate package | By design |
 | `billing/event/` | Shared wire type, codec, fingerprint | Done |
 | `billing/consumer/` | Drains the log into Postgres | Done: exactly-once via same-transaction offset |
 | `billing/pricing/` | Meters, plans, rating | Done: flat, graduated, volume; pure |
 | `billing/invoicing/` | Periods, invoices, chart of accounts, revenue recognition | Done: I4 enforced, late roll-forward |
 | `billing/ledger/` | Double-entry posting | Done: balanced by construction, DB-enforced |
 | `broker/log/` | Segment format, offset index, recovery | Done: framing, segments, recovery, sparse index, fsync dial |
-| `bench/` | Throughput and latency benchmarks | Go benchmarks live beside the log; this dir still empty |
 | `chaos/` | Fault injection, invariant assertions | Done: 7 scenarios, mutation-checked |
-| `migrations/` | golang-migrate SQL | 1 migration |
-| `docs/adr/` | Design decisions | 3 ADRs |
+| `migrations/` | golang-migrate SQL | 6, round-tripped in CI |
+| `docs/adr/` | Design decisions | 18 ADRs |
+| `.github/workflows/` | CI: format, vet, build, race tests, no-skip gate | Green |
 
-**Note:** `billing/dedup/`, `billing/ledger/`, and `broker/log/` are singled out
+**Note:** `broker/log/`, `billing/ledger/`, and `billing/consumer/` are singled out
 in CLAUDE.md as the three components that matter most — the interview
 conversation, with everything else supporting them. They get the most care, the
 best tests, and the clearest comments. They are Phases 1, 5, and 2.
@@ -167,65 +167,71 @@ best tests, and the clearest comments. They are Phases 1, 5, and 2.
 
 ## 4. Where we are today
 
-Verified 2026-08-03 against the working tree.
+Verified 2026-08-19 against the working tree. **28 commits, HEAD at `810dd2c`.**
 
-### Committed and working
+Phases 1-8 are complete. CI is green on Linux with the race detector.
 
-- **7 commits**, HEAD at `a4fe384`.
-- **Postgres 16** via [docker-compose.yml](docker-compose.yml) — one service,
-  named volume `pgdata`, `pg_isready` healthcheck.
-- **Migration 000001** creates `events` with the six ADR-0001 fields,
-  `id BIGINT GENERATED ALWAYS AS IDENTITY` PK, `quantity NUMERIC(38,9)`,
-  both timestamps as `TIMESTAMPTZ`, `UNIQUE (tenant_id, idempotency_key)`, and
-  an index on `(tenant_id, occurred_at)`. Applied, reversed, and re-applied
-  cleanly with `golang-migrate` in the previous session.
-- **`POST /events`** accepts JSON, inserts one row, returns `202 {"id":N}`.
-  Verified: a second request with the same key returns `500` and the log shows
-  the `23505` unique violation. One row in the table, not two.
-- **Three ADRs** — [0001 event schema](docs/adr/0001-event-schema.md),
-  [0002 dedup enforcement](docs/adr/0002-dedup-enforcement.md),
-  [0003 postgres driver](docs/adr/0003-postgres-driver.md).
-- **One dependency:** `jackc/pgx/v5`, used only through `database/sql`.
+### The pipeline, end to end
 
-### Not currently running
+`POST /events` validates and **appends to the broker log** - it does not touch
+Postgres at all, which is what lets it keep accepting usage while the database
+is down. It answers `202 {"offset": N}` only after a group-commit fsync covers
+the record.
 
-Docker Desktop is stopped and nothing is listening on `:8080`. Neither is a
-problem — both are started on demand — but it means the database contents are
-unverified as of today.
+A consumer drains the log into `events`, advancing its committed offset **in the
+same transaction** as the rows it writes. Anything it cannot apply goes to
+`dead_letters` with the raw record. Closing a billing period gathers unbilled
+usage, prices it, issues an immutable invoice, marks the events, and posts the
+revenue to a double-entry ledger - all one transaction.
 
-### Ingest is now correct and tested (2026-08-03)
+**The demo:** post the same event twice. Two `202`s, two log records, one row in
+`events`, one cent on the invoice.
 
-- **A duplicate returns `202` with `{"id":N,"duplicate":true}`** — same id, one
-  row. `ON CONFLICT DO UPDATE` with `(xmax = 0)` to tell insert from conflict.
-  See [ADR-0004](docs/adr/0004-ingest-api-contract.md).
-- **Full validation** ahead of any database work: required fields, decimal
-  quantity within `NUMERIC(38,9)`, no negatives, no scientific notation,
-  5-minute clock-skew tolerance, 35-day backfill bound, unknown fields
-  rejected.
-- **Reuse detection.** Every event stores a SHA-256 fingerprint over its
-  billable fields. A key returning with different content gets
-  `409 idempotency_key_reuse` instead of being silently discarded with a `202`.
-  Formatting differences (`"1"` vs `"1.0"`) canonicalise to the same
-  fingerprint, so a reformatted retry is still a retry. See
-  [ADR-0005](docs/adr/0005-payload-fingerprint.md).
-- **64 assertions, all passing**, against a real Postgres. Confirmed genuinely
-  running rather than skipped. Mutation-checked twice: breaking duplicate
-  detection fails `TestRetryIsIdempotent`, and removing the fingerprint's
-  length prefix fails `TestFingerprintIsUnambiguousAcrossFieldBoundaries`. The
-  assertions have teeth.
-- `TestConcurrentRetriesProduceOneRow` — 50 concurrent goroutines with the same
-  key produce exactly one row. This is the test that earns ADR-0002's rejection
-  of check-then-insert: a `SELECT`-then-`INSERT` implementation passes the
-  simple retry test and fails this one.
+### Numbers
+
+| | |
+|---|---|
+| Tests | 237, none skipped |
+| CI | Green, `go test -race` on Linux, chaos included |
+| Migrations | 6, round-tripped in CI |
+| ADRs | 18 |
+| Go | ~9,800 lines across 38 files |
+| Dependencies | 1 direct (`jackc/pgx/v5`) |
+
+### Where each invariant is enforced
+
+| | Enforced by |
+|---|---|
+| I1 money conserved | Transfers that cannot express an imbalance + a deferred Postgres trigger |
+| I2 no double billing | `UNIQUE (tenant_id, idempotency_key)` + derived ledger idempotency keys |
+| I3 nothing silently lost | `dead_letters` with the raw record + `Stats.Accounted()` |
+| I4 invoices immutable | `BEFORE UPDATE OR DELETE` triggers that raise unconditionally |
+| I5 deterministic replay | Pure rating, sorted output, offset inside the write transaction |
+| I6 no float | An AST-walking test over every file under `billing/` |
 
 ### Test harness
 
-`internal/testdb` gives each test a real Postgres, against a **separate
-`ledgerline_test` database** so the dev database is never touched. Schema is
-dropped and replayed from `migrations/` once per binary; tables are truncated
-between tests. Tests **skip** rather than fail when no database is reachable,
-which keeps `go test ./...` usable without Docker — at the cost that a green
-run proves nothing unless the tests actually ran. CI must assert that.
+`internal/testdb` gives each **package** its own database, named after its path -
+`go test ./...` runs one binary per package in parallel, and a shared database
+means they rebuild the schema underneath each other. The schema is dropped and
+replayed from `migrations/` so tests always run against what the migrations
+describe.
+
+Tests **skip** when no database is reachable, which keeps the local loop usable.
+CI sets `LEDGERLINE_REQUIRE_DB`, which turns that skip into a failure, and fails
+the build on any skipped test.
+
+### Picking this up on a new machine
+
+1. Docker Desktop running, then `docker compose up -d`
+2. `go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1`
+3. `migrate -path migrations -database "postgres://ledgerline:ledgerline@localhost:5432/ledgerline?sslmode=disable" up`
+4. `go test ./...` - or `-short` to skip the ~20s chaos suite
+
+Known environment wrinkle: if Docker Desktop fails to start with a socket error,
+it has left stale AF_UNIX reparse points behind. Quit it, rename or delete
+`%LOCALAPPDATA%\Docker\run` and `%LOCALAPPDATA%\docker-secrets-engine`, and relaunch.
+That is D20 and it has recurred several times.
 
 ---
 

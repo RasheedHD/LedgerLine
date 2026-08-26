@@ -429,3 +429,24 @@ making it *deliberate* leaves a visible `.Log` at the call site marking the
 choice. Also decided to keep `SyncEveryN` rather than delete it - a dial with a
 setting removed because it was misusable explains less than a dial that cannot
 be misused where it matters.
+
+## 2026-08-19 (cont.) - documentation sync before switching machines
+
+**What we built:** No code. Audited every document for staleness before cloning
+the repo elsewhere. PLAN.md section 4 was frozen at Phase 1 and actively wrong -
+it claimed `POST /events` inserts into Postgres and returns `duplicate: true`,
+both superseded by ADR-0012. Rewrote it, fixed the architecture diagram and
+component map, marked ADR-0014 superseded in the file itself rather than only in
+the index, and pointed CLAUDE.md at PLAN.md.
+
+**Key decision:** CLAUDE.md is the file Claude Code loads automatically, and it
+never mentioned PLAN.md. A fresh session on another machine would have read the
+working agreement and never found the anchor document. That pointer is now the
+first section.
+
+**Couldn't have written myself yet:** That I almost reported a green test run
+that proved nothing. `go test ./...` came back all `ok` in a few seconds, and
+only checking the skip count showed 45 tests skipping because Postgres was down.
+That is exactly the failure LEDGERLINE_REQUIRE_DB exists to prevent in CI, and
+locally there is nothing to stop it - so "ok" on a fast run is a signal to check
+the skip count, not a result.

@@ -1,10 +1,17 @@
 # ADR-0014: Posting usage to the ledger
 
-- **Status:** Accepted
+- **Status:** SUPERSEDED by [ADR-0015](0015-periods-and-invoices.md)
 - **Date:** 2026-08-11
 - **Deciders:** Rasheed
 - **Related:** [ADR-0010](0010-double-entry-ledger.md), [ADR-0011](0011-pricing.md)
 - **Resolves:** PLAN.md debt item D35
+
+> **Superseded (2026-08-11):** the `billing/posting` package described here no
+> longer exists. Its `Post` had no notion of invoices, so once invoicing landed
+> it would have re-billed events already billed. The chart-of-accounts naming
+> and the derived idempotency key moved to `billing/invoicing` unchanged; the
+> period-aware billing run replaced the rest. The reasoning below still explains
+> *why* those pieces are shaped as they are.
 
 ## Context
 
