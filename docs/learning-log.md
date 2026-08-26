@@ -450,3 +450,24 @@ only checking the skip count showed 45 tests skipping because Postgres was down.
 That is exactly the failure LEDGERLINE_REQUIRE_DB exists to prevent in CI, and
 locally there is nothing to stop it - so "ok" on a fast run is a signal to check
 the skip count, not a result.
+
+## 2026-08-26 - CI stopped executing
+
+**What we built:** No feature work. Bumped `actions/checkout` and
+`actions/setup-go` from v4/v5 to v7 - the Node 20 grace period those pinned
+versions relied on has ended - and added `workflow_dispatch` so a run can be
+started by hand.
+
+**Key decision:** Record it as debt (D48) rather than keep digging. The evidence
+is exhausted from this side: the workflow file is byte-identical to the version
+that passed on 2026-08-19, parses as valid YAML, is LF-only, matches the copy on
+the remote, and the API reports Actions operational with the workflow active. A
+manual dispatch does create a run, so the file and the action references resolve
+- but that run sat queued without starting a job.
+
+**Couldn't have written myself yet:** How to read the difference between the two
+failure shapes. `startup_failure` means GitHub parsed the workflow well enough to
+create a run and then could not begin it, which points at the actions it
+references. *No run record at all* means the push event never produced one,
+which points at triggering or queueing rather than at the file. Those look alike
+in the Actions tab and mean quite different things.
